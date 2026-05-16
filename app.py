@@ -1,0 +1,411 @@
+"""Streamlit crypto backtesting app.
+
+Run: streamlit run app.py
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone, timedelta
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+
+from data import fetch_ohlcv, get_binance_fees, get_top_symbols
+from strategies import STRATEGIES
+from backtest import run_backtest
+
+
+st.set_page_config(page_title="Crypto 4H Backtester", page_icon="📈", layout="wide")
+st.title("📈 Crypto 4H Backtester")
+st.caption(
+    "Top-100 crypto universe (CoinGecko), Binance OHLCV via CCXT, "
+    "11 strategies across trend / mean-reversion / momentum / volatility."
+)
+
+
+def fmt_pct(x): return "—" if pd.isna(x) else f"{x*100:.2f}%"
+def fmt_num(x): return "—" if pd.isna(x) else f"{x:.2f}"
+
+
+# ===== Sidebar (shared controls) =====
+with st.sidebar:
+    st.header("Universe & Data")
+    market_label = st.radio("Market", ["Spot", "Futures (USDⓂ Perp)"], index=0, horizontal=True)
+    market = "futures" if market_label.startswith("Futures") else "spot"
+    quote = st.selectbox("Quote currency", ["USDT", "USDC", "BUSD"], 0,
+                         disabled=(market == "futures"),
+                         help="USDⓂ perpetuals are quoted in USDT.")
+    if market == "futures":
+        quote = "USDT"
+    with st.spinner(f"Loading top-100 {market} universe…"):
+        try:
+            universe = get_top_symbols(quote=quote, limit=100, market=market)
+        except Exception as e:
+            st.error(f"Failed to load universe: {e}")
+            st.stop()
+    if universe.empty:
+        st.error("No symbols available.")
+        st.stop()
+
+    label_map = {
+        f"#{int(r['rank']):>3}  {r['symbol']}  ·  {r['name']}": r["symbol"]
+        for _, r in universe.iterrows()
+    }
+
+    st.header("Mode")
+    mode = st.radio(
+        "Backtest mode",
+        ["Single strategy", "Find best strategy (all strategies × symbols)"],
+        index=0,
+    )
+
+    BINANCE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h",
+                          "6h", "8h", "12h", "1d", "3d", "1w", "1M"]
+    tf_choice = st.selectbox("Timeframe", BINANCE_TIMEFRAMES + ["Custom…"],
+                             index=BINANCE_TIMEFRAMES.index("4h"))
+    if tf_choice == "Custom…":
+        timeframe = st.text_input(
+            "Custom timeframe", value="4h",
+            help="Any Binance-supported timeframe: 1m, 3m, 5m, 15m, 30m, 1h, "
+                 "2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M.",
+        ).strip()
+    else:
+        timeframe = tf_choice
+    lookback_days = st.slider("Lookback (days)", 90, 365 * 5, 365 * 2, step=30)
+
+    # Costs depend on selected symbol (single) or the market default (tournament)
+    if mode.startswith("Single"):
+        labels = list(label_map.keys())
+        label = st.selectbox(f"Symbol ({len(universe)} available)", labels, index=0)
+        symbol = label_map[label]
+        symbols_selected: list[str] = [symbol]
+    else:
+        defaults = list(label_map.keys())[:5]
+        labels = st.multiselect(
+            f"Symbols ({len(universe)} available)",
+            list(label_map.keys()),
+            default=defaults,
+            help="Pick 1+ symbols; all strategies will be run on each.",
+        )
+        symbols_selected = [label_map[l] for l in labels]
+        symbol = symbols_selected[0] if symbols_selected else next(iter(label_map.values()))
+
+    st.header("Costs (live from Binance)")
+    try:
+        fees = get_binance_fees(symbol, market=market)
+        binance_taker = fees["taker_bps"]
+        binance_maker = fees["maker_bps"]
+        st.caption(
+            f"Binance {market} **{symbol}** — maker `{binance_maker:.2f} bps` · "
+            f"taker `{binance_taker:.2f} bps`."
+        )
+    except Exception as e:
+        binance_taker, binance_maker = (5.0, 2.0) if market == "futures" else (10.0, 10.0)
+        st.warning(f"Could not fetch Binance fees ({e}); using defaults.")
+
+    fee_mode = st.radio(
+        "Fee model",
+        ["Taker (market orders)", "Maker (limit orders)", "Custom"],
+        index=0, horizontal=True,
+    )
+    if fee_mode.startswith("Taker"):
+        fee_bps = float(binance_taker)
+    elif fee_mode.startswith("Maker"):
+        fee_bps = float(binance_maker)
+    else:
+        fee_bps = st.number_input("Fee (bps per side)", 0.0, 100.0, float(binance_taker), 0.5)
+
+    slip_bps = st.number_input("Slippage (bps per side)", 0.0, 100.0, 5.0, 1.0,
+                               help="Added on top of fees per fill.")
+    st.caption(f"➡ Round-trip cost per turn: **{(fee_bps + slip_bps):.2f} bps** (charged on **notional**).")
+
+    st.header("Position Sizing")
+    if market == "futures":
+        risk_pct = st.slider("Capital allocated per trade (%)", 1.0, 100.0, 5.0, 1.0,
+                             help="Fraction of equity put up as margin. Default 5%.")
+        leverage = st.slider("Leverage (×)", 1.0, 25.0, 1.0, 1.0,
+                             help="Notional multiplier. 1× = no leverage.")
+        position_size = risk_pct / 100.0
+        notional_pct = position_size * leverage * 100
+        st.caption(
+            f"➡ Notional per trade: **{notional_pct:.1f}%** of equity "
+            f"({risk_pct:.0f}% capital × {leverage:.0f}× leverage). "
+            f"Fees are charged on this notional, not just capital."
+        )
+    else:
+        risk_pct = st.slider("Capital allocated per trade (%)", 1.0, 100.0, 100.0, 1.0,
+                             help="Spot default: 100% (fully invested when in a position).")
+        leverage = 1.0
+        position_size = risk_pct / 100.0
+        st.caption(f"➡ Notional per trade: **{position_size * 100:.1f}%** of equity.")
+
+    allow_short = st.checkbox("Allow shorting", value=False)
+
+    # Strategy picker only in single mode
+    if mode.startswith("Single"):
+        st.header("Strategy")
+        strat_name = st.selectbox("Strategy", list(STRATEGIES.keys()))
+        spec = STRATEGIES[strat_name]
+        st.caption(f"**{spec.family}** — {spec.description}")
+        with st.expander("Entry / Exit / TP·SL rules", expanded=True):
+            st.markdown(
+                f"**Entry:** {spec.entry_rule}\n\n"
+                f"**Exit (backtested):** {spec.exit_rule}\n\n"
+                f"**Suggested TP / SL (not in backtest):** {spec.suggested_tp_sl}"
+            )
+
+        params: dict = {"allow_short": allow_short}
+        for pname, p in spec.params.items():
+            default, lo, hi, step = p
+            if isinstance(default, float) or isinstance(step, float):
+                params[pname] = st.slider(pname, float(lo), float(hi), float(default), float(step))
+            else:
+                params[pname] = st.slider(pname, int(lo), int(hi), int(default), int(step))
+        run = st.button("▶ Run backtest", type="primary", use_container_width=True)
+    else:
+        st.header("Strategies")
+        st.caption("All strategies run with **default parameters**.")
+        rank_metric = st.selectbox(
+            "Rank by",
+            ["Total Return", "CAGR", "Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"],
+            index=0,
+        )
+        run = st.button("▶ Run tournament", type="primary", use_container_width=True)
+
+
+# ===== Landing screen =====
+if not run:
+    st.info("Configure your test in the sidebar and click **Run**.")
+    st.subheader("Available strategies")
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "Strategy": s.name,
+                "Family": s.family,
+                "Entry": s.entry_rule,
+                "Exit (backtested)": s.exit_rule,
+                "Suggested TP / SL": s.suggested_tp_sl,
+            }
+            for s in STRATEGIES.values()
+        ]),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Backtester uses **signal-based exits** (e.g. opposite cross, midline revert). "
+        "*Suggested TP / SL* is reference for live trading — not applied in the backtest."
+    )
+    st.stop()
+
+
+# Common: convert lookback to since_ms
+since_ms = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
+
+
+# ===== Mode 1: Single strategy =====
+if mode.startswith("Single"):
+    with st.spinner(f"Fetching {market} {symbol} {timeframe} candles…"):
+        try:
+            df = fetch_ohlcv(symbol, timeframe=timeframe, since_ms=since_ms, market=market)
+        except Exception as e:
+            st.error(f"Data fetch failed: {e}")
+            st.stop()
+
+    if len(df) < 100:
+        st.error(f"Not enough data ({len(df)} bars). Try a longer lookback.")
+        st.stop()
+
+    st.success(f"Loaded {len(df):,} {timeframe} bars · {df.index[0].date()} → {df.index[-1].date()}")
+
+    positions = spec.func(df, **params)
+    result = run_backtest(df, positions, fee_bps=fee_bps, slippage_bps=slip_bps,
+                          position_size=position_size, leverage=leverage)
+
+
+    m = result.metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Return", fmt_pct(m["Total Return"]), f"B&H: {fmt_pct(m['Buy & Hold Return'])}")
+    c2.metric("CAGR", fmt_pct(m["CAGR"]))
+    c3.metric("Sharpe", fmt_num(m["Sharpe"]))
+    c4.metric("Max DD", fmt_pct(m["Max Drawdown"]))
+    c5.metric("# Trades", str(m["# Trades"]))
+    c6, c7, c8, c9, c10, c11 = st.columns(6)
+    c6.metric("Sortino", fmt_num(m["Sortino"]))
+    c7.metric("Calmar", fmt_num(m["Calmar"]))
+    c8.metric("Win Rate", fmt_pct(m["Win Rate"]))
+    c9.metric("Profit Factor", fmt_num(m["Profit Factor"]))
+    c10.metric("R:R", fmt_num(m["R:R"]),
+               f"avg win {fmt_pct(m['Avg Win'])} / loss {fmt_pct(m['Avg Loss'])}")
+    c11.metric("Exposure", fmt_pct(m["Exposure"]))
+
+    bh_equity = (df["close"] / df["close"].iloc[0])
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
+                        vertical_spacing=0.04,
+                        subplot_titles=("Equity (strategy vs buy & hold)", "Price with position shading"))
+    fig.add_trace(go.Scatter(x=result.equity.index, y=result.equity.values,
+                             name="Strategy", line=dict(color="#2E86DE", width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=bh_equity.index, y=bh_equity.values,
+                             name="Buy & Hold", line=dict(color="#888", width=1, dash="dot")),
+                  row=1, col=1)
+    fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"],
+                                 low=df["low"], close=df["close"], name="Price",
+                                 showlegend=False), row=2, col=1)
+
+    held = result.positions
+    def _shade(mask, color):
+        in_block = False
+        start = None
+        for ts, v in mask.items():
+            if v and not in_block:
+                start = ts; in_block = True
+            elif not v and in_block:
+                fig.add_vrect(x0=start, x1=ts, fillcolor=color, opacity=0.12,
+                              line_width=0, row=2, col=1)
+                in_block = False
+        if in_block:
+            fig.add_vrect(x0=start, x1=mask.index[-1], fillcolor=color, opacity=0.12,
+                          line_width=0, row=2, col=1)
+    _shade((held == 1), "#26a69a")
+    _shade((held == -1), "#ef5350")
+
+    fig.update_layout(height=720, xaxis_rangeslider_visible=False,
+                      xaxis2_rangeslider_visible=False, margin=dict(t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander(f"Trade ledger ({len(result.trades)} trades)", expanded=False):
+        if result.trades.empty:
+            st.write("No completed trades.")
+        else:
+            t = result.trades.copy()
+            t["return"] = (t["return"] * 100).round(3)
+            st.dataframe(t, use_container_width=True, hide_index=True)
+            st.download_button("Download trades CSV", result.trades.to_csv(index=False).encode(),
+                               file_name=f"{symbol.replace('/', '')}_{strat_name}_trades.csv",
+                               mime="text/csv")
+    with st.expander("Equity curve CSV"):
+        eq = pd.DataFrame({"equity": result.equity, "returns": result.returns,
+                           "position": result.positions})
+        st.download_button("Download equity CSV", eq.to_csv().encode(),
+                           file_name=f"{symbol.replace('/', '')}_{strat_name}_equity.csv",
+                           mime="text/csv")
+
+# ===== Mode 2: Find best strategy =====
+else:
+    if not symbols_selected:
+        st.error("Pick at least one symbol.")
+        st.stop()
+
+    st.subheader(f"🏆 Strategy tournament — {len(symbols_selected)} symbol(s) × {len(STRATEGIES)} strategies")
+    st.caption(f"**Lookback:** {lookback_days} days  ·  **Timeframe:** {timeframe}")
+
+    # Fetch all symbols' data once
+    data: dict[str, pd.DataFrame] = {}
+    prog = st.progress(0.0, text="Fetching data…")
+    for i, sym in enumerate(symbols_selected, 1):
+        try:
+            d = fetch_ohlcv(sym, timeframe=timeframe, since_ms=since_ms, market=market)
+            if len(d) >= 100:
+                data[sym] = d
+            else:
+                st.warning(f"Skipping {sym}: only {len(d)} bars.")
+        except Exception as e:
+            st.warning(f"Skipping {sym}: {e}")
+        prog.progress(i / len(symbols_selected), text=f"Fetching {sym}…")
+    prog.empty()
+
+    if not data:
+        st.error("No usable data for the selected symbols.")
+        st.stop()
+
+    # Run all strategies on each symbol
+    rows: list[dict] = []
+    equity_curves: dict[tuple[str, str], pd.Series] = {}  # (symbol, strategy) -> equity
+    total = len(data) * len(STRATEGIES)
+    prog = st.progress(0.0, text="Running backtests…")
+    step = 0
+    for sym, df in data.items():
+        for sname, sp in STRATEGIES.items():
+            step += 1
+            prog.progress(step / total, text=f"{sym} · {sname}")
+            try:
+                default_params = {k: v[0] for k, v in sp.params.items()}
+                pos = sp.func(df, allow_short=allow_short, **default_params)
+                res = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps,
+                                   position_size=position_size, leverage=leverage)
+                m = res.metrics
+                rows.append({
+                    "Symbol": sym, "Strategy": sname, "Family": sp.family,
+                    "Total Return": m["Total Return"], "CAGR": m["CAGR"],
+                    "Buy & Hold Return": m["Buy & Hold Return"],
+                    "Sharpe": m["Sharpe"], "Sortino": m["Sortino"],
+                    "Calmar": m["Calmar"], "Max DD": m["Max Drawdown"],
+                    "Profit Factor": m["Profit Factor"], "R:R": m["R:R"],
+                    "Win Rate": m["Win Rate"],
+                    "# Trades": m["# Trades"], "Exposure": m["Exposure"],
+                })
+                equity_curves[(sym, sname)] = res.equity
+            except Exception as e:
+                rows.append({"Symbol": sym, "Strategy": sname, "Family": sp.family,
+                             "Total Return": float("nan"), "error": str(e)})
+    prog.empty()
+
+    results = pd.DataFrame(rows)
+
+    # Per-symbol best
+    st.subheader("🥇 Best strategy per symbol")
+    best_per_sym = (results.sort_values(rank_metric, ascending=False)
+                          .groupby("Symbol", as_index=False).first())
+    show_cols = ["Symbol", "Strategy", "Family", "Total Return", "CAGR",
+                 "Buy & Hold Return", "Sharpe", "Max DD", "Profit Factor", "R:R",
+                 "Win Rate", "# Trades"]
+    disp = best_per_sym[show_cols].copy()
+    for c in ["Total Return", "CAGR", "Buy & Hold Return", "Max DD", "Win Rate"]:
+        disp[c] = disp[c].map(fmt_pct)
+    for c in ["Sharpe", "Profit Factor", "R:R"]:
+        disp[c] = disp[c].map(fmt_num)
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # Aggregate across symbols
+    st.subheader(f"📊 Strategy leaderboard (averaged across {len(data)} symbol(s), ranked by {rank_metric})")
+    agg = (results.groupby(["Strategy", "Family"], as_index=False)
+                  .agg({"Total Return": "mean", "CAGR": "mean",
+                        "Sharpe": "mean", "Sortino": "mean", "Calmar": "mean",
+                        "Max DD": "mean", "Profit Factor": "mean", "R:R": "mean",
+                        "Win Rate": "mean", "# Trades": "mean"})
+                  .sort_values(rank_metric, ascending=False))
+    agg_disp = agg.copy()
+    for c in ["Total Return", "CAGR", "Max DD", "Win Rate"]:
+        agg_disp[c] = agg_disp[c].map(fmt_pct)
+    for c in ["Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"]:
+        agg_disp[c] = agg_disp[c].map(fmt_num)
+    agg_disp["# Trades"] = agg_disp["# Trades"].round(0).astype(int)
+    st.dataframe(agg_disp, use_container_width=True, hide_index=True)
+
+    winner = agg.iloc[0]["Strategy"]
+    st.success(f"🏆 Overall winner by **{rank_metric}**: **{winner}** "
+               f"(mean {rank_metric}: {fmt_pct(agg.iloc[0][rank_metric]) if rank_metric in ['Total Return','CAGR','Max DD','Win Rate'] else fmt_num(agg.iloc[0][rank_metric])})")
+
+    # Equity curves of the winner across all symbols
+    st.subheader(f"Equity curves — {winner}")
+    fig = go.Figure()
+    for sym in data.keys():
+        eq = equity_curves.get((sym, winner))
+        if eq is not None:
+            fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name=sym, mode="lines"))
+    fig.update_layout(height=450, margin=dict(t=30, b=20),
+                      yaxis_title="Equity (start = 1.0)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Full results table + download
+    with st.expander(f"All results ({len(results)} rows)", expanded=False):
+        full = results.copy()
+        for c in ["Total Return", "CAGR", "Buy & Hold Return", "Max DD",
+                  "Win Rate", "Exposure"]:
+            if c in full:
+                full[c] = full[c].map(fmt_pct)
+        for c in ["Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"]:
+            if c in full:
+                full[c] = full[c].map(fmt_num)
+        st.dataframe(full, use_container_width=True, hide_index=True)
+        st.download_button("Download full results CSV", results.to_csv(index=False).encode(),
+                           file_name="tournament_results.csv", mime="text/csv")
