@@ -4,7 +4,13 @@ Run: streamlit run app.py
 """
 from __future__ import annotations
 
+import json
+import os
+import signal
+import subprocess
+import sys
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -160,6 +166,10 @@ with st.sidebar:
 
     allow_short = st.checkbox("Allow shorting", value=False)
 
+    # Defaults so the live-trade form works in every mode
+    strat_name: str = next(iter(STRATEGIES))
+    params: dict = {"allow_short": allow_short}
+
     # Strategy picker only in single mode
     if mode.startswith("Single"):
         st.header("Strategy")
@@ -190,6 +200,181 @@ with st.sidebar:
             index=0,
         )
         run = st.button("▶ Run tournament", type="primary", use_container_width=True)
+
+    st.divider()
+    st.header("Live trading")
+    if st.button("🚀 Start trading", use_container_width=True,
+                 help="Opens a form to launch a real (or dry-run) auto-trader using your API keys."):
+        st.session_state["show_trade_form"] = True
+    if st.session_state.get("trader") and st.button(
+        "■ Stop running trader", use_container_width=True
+    ):
+        try:
+            os.kill(int(st.session_state["trader"]["pid"]), signal.SIGTERM)
+            st.success("Sent SIGTERM to trader.")
+        except ProcessLookupError:
+            st.info("Trader already exited.")
+        except Exception as e:
+            st.error(f"Failed to stop: {e}")
+
+
+# ===== Live trader form & status panel =====
+_LOG_DIR = Path("/tmp")
+
+
+def _trader_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _render_trade_form():
+    st.subheader("🚀 Launch auto-trader")
+    st.warning(
+        "Your API keys are passed to the trader subprocess **via environment "
+        "variables only**, then cleared from this app's session. They are "
+        "never written to disk or argv by this app.\n\n"
+        "**For your protection:** create a Binance API key with **trading "
+        "enabled but withdrawals disabled**, and IP-whitelist it.",
+        icon="🔐",
+    )
+    with st.form("trade_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        api_key = c1.text_input("Binance API key", type="password", autocomplete="off")
+        api_secret = c2.text_input("Binance API secret", type="password", autocomplete="off")
+
+        c1, c2, c3 = st.columns(3)
+        f_market = c1.selectbox("Market", ["spot", "futures"],
+                                index=0 if market == "spot" else 1)
+        f_symbol = c2.text_input("Symbol", value=symbols_selected[0] if symbols_selected else "BTC/USDT")
+        f_tf = c3.selectbox("Timeframe", BINANCE_TIMEFRAMES,
+                            index=BINANCE_TIMEFRAMES.index(timeframe) if timeframe in BINANCE_TIMEFRAMES else BINANCE_TIMEFRAMES.index("1h"))
+
+        c1, c2, c3 = st.columns(3)
+        f_strat = c1.selectbox(
+            "Strategy", list(STRATEGIES.keys()),
+            index=(list(STRATEGIES.keys()).index(strat_name)
+                   if mode.startswith("Single") else 0),
+        )
+        f_notional = c2.number_input("Notional per trade (USDT)", min_value=10.0,
+                                     max_value=1_000_000.0, value=50.0, step=10.0)
+        f_lev = c3.number_input("Leverage (futures only)", min_value=1.0, max_value=25.0,
+                                value=float(leverage), step=1.0)
+
+        spec_for_trade = STRATEGIES[f_strat]
+        st.caption(f"**Entry:** {spec_for_trade.entry_rule}")
+        param_vals: dict = {}
+        cols = st.columns(max(1, len(spec_for_trade.params)))
+        for (pname, (default, lo, hi, step)), col in zip(spec_for_trade.params.items(), cols):
+            if isinstance(default, float) or isinstance(step, float):
+                # source default from sidebar if same strat, else spec default
+                src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
+                param_vals[pname] = col.number_input(pname, float(lo), float(hi),
+                                                     float(src), float(step))
+            else:
+                src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
+                param_vals[pname] = col.number_input(pname, int(lo), int(hi),
+                                                     int(src), int(step))
+
+        c1, c2 = st.columns(2)
+        f_allow_short = c1.checkbox("Allow shorting", value=bool(allow_short))
+        f_live = c2.checkbox(
+            "⚠️ LIVE — submit real orders",
+            value=False,
+            help="Unchecked = dry-run (default). Logs the orders it would place but submits nothing.",
+        )
+
+        c1, c2 = st.columns(2)
+        submit = c1.form_submit_button("▶ Launch trader", type="primary",
+                                       use_container_width=True)
+        cancel = c2.form_submit_button("Cancel", use_container_width=True)
+
+    if cancel:
+        st.session_state["show_trade_form"] = False
+        st.rerun()
+
+    if not submit:
+        return
+
+    if not api_key or not api_secret:
+        st.error("Both API key and secret are required.")
+        return
+
+    cmd = [
+        sys.executable, "-u", "trade.py",
+        "--market", f_market, "--symbol", f_symbol, "--tf", f_tf,
+        "--strategy", f_strat, "--params", json.dumps(param_vals),
+        "--notional-usdt", str(f_notional), "--leverage", str(f_lev),
+    ]
+    if f_allow_short:
+        cmd.append("--allow-short")
+    if f_live:
+        cmd.append("--live")
+
+    env = os.environ.copy()
+    env["BINANCE_API_KEY"] = api_key
+    env["BINANCE_API_SECRET"] = api_secret
+
+    log_path = _LOG_DIR / f"auto_trader_{int(datetime.now().timestamp())}.log"
+    log_f = open(log_path, "w")
+    proc = subprocess.Popen(
+        cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT,
+        cwd=str(Path(__file__).parent), start_new_session=True,
+    )
+
+    # ⚠ Wipe keys from local memory immediately. (Python doesn't guarantee
+    # the underlying string buffer is zeroed, but at least no reference is
+    # held by the app process beyond this point.)
+    api_key = api_secret = None
+    del env  # the subprocess has its own copy now.
+
+    st.session_state["trader"] = {
+        "pid": proc.pid,
+        "log_path": str(log_path),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "LIVE" if f_live else "DRY-RUN",
+        "symbol": f_symbol, "strategy": f_strat, "market": f_market, "tf": f_tf,
+    }
+    st.session_state["show_trade_form"] = False
+    st.success(f"Trader launched (PID {proc.pid}). Log: `{log_path}`")
+    st.rerun()
+
+
+def _render_trader_status():
+    t = st.session_state.get("trader")
+    if not t:
+        return
+    pid = int(t["pid"])
+    alive = _trader_alive(pid)
+    st.subheader("📡 Auto-trader status")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("PID", str(pid))
+    c2.metric("Status", "🟢 running" if alive else "⚪ stopped")
+    c3.metric("Mode", t["mode"])
+    c4.metric("Symbol", t["symbol"])
+    c5.metric("Strategy", t["strategy"])
+    st.caption(f"Started: {t['started_at']}  ·  Market: {t['market']}  ·  TF: {t['tf']}  ·  Log: `{t['log_path']}`")
+    try:
+        tail = Path(t["log_path"]).read_text(errors="replace").splitlines()[-200:]
+        st.code("\n".join(tail) or "(no output yet)", language="text")
+    except FileNotFoundError:
+        st.info("Log file not yet created.")
+    cA, cB = st.columns(2)
+    if cA.button("🔄 Refresh log"):
+        st.rerun()
+    if alive and cB.button("■ Send SIGTERM"):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            st.success("Sent SIGTERM.")
+        except Exception as e:
+            st.error(f"Failed: {e}")
+
+
+if st.session_state.get("show_trade_form"):
+    _render_trade_form()
+_render_trader_status()
 
 
 # ===== Landing screen =====
