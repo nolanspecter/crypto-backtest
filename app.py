@@ -220,6 +220,48 @@ with st.sidebar:
 
 # ===== Live trader form & status panel =====
 _LOG_DIR = Path("/tmp")
+_KEY_STORE = Path.home() / ".crypto-backtest" / "binance.json"
+
+
+def _load_saved_keys() -> dict:
+    """Best-effort load of {api_key, api_secret} from a local file."""
+    try:
+        if _KEY_STORE.exists():
+            return json.loads(_KEY_STORE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_keys(api_key: str, api_secret: str) -> Path:
+    """Persist keys to ~/.crypto-backtest/binance.json with mode 0600.
+
+    Uses os.open with O_CREAT|O_WRONLY|O_TRUNC and mode 0o600 so the file is
+    created with restrictive permissions from the start (no chmod race).
+    """
+    _KEY_STORE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(_KEY_STORE.parent, 0o700)
+    except OSError:
+        pass
+    payload = json.dumps({"api_key": api_key, "api_secret": api_secret})
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+    fd = os.open(str(_KEY_STORE), flags, 0o600)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return _KEY_STORE
+
+
+def _delete_saved_keys() -> bool:
+    try:
+        if _KEY_STORE.exists():
+            _KEY_STORE.unlink()
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _trader_alive(pid: int) -> bool:
@@ -232,22 +274,54 @@ def _trader_alive(pid: int) -> bool:
 
 def _render_trade_form():
     st.subheader("🚀 Launch auto-trader")
+    saved = _load_saved_keys()
+    if saved:
+        st.info(
+            f"🗝 Loaded saved API keys from `{_KEY_STORE}`. "
+            "Untick 'Remember keys' below before launching if you want them removed.",
+            icon="ℹ️",
+        )
     st.warning(
         "Your API keys are passed to the trader subprocess **via environment "
-        "variables only**, then cleared from this app's session. They are "
-        "never written to disk or argv by this app.\n\n"
+        "variables only** and then cleared from this app's session.\n\n"
+        "If you tick **'Remember keys on this machine'**, the keys are written "
+        f"in plaintext to `{_KEY_STORE}` (mode 0600). Anyone with read access "
+        "to your home directory can recover them. Leave unticked for the safer "
+        "behavior (no disk persistence).\n\n"
         "**For your protection:** create a Binance API key with **trading "
         "enabled but withdrawals disabled**, and IP-whitelist it.",
         icon="🔐",
     )
+    # Prefill from saved keys exactly once (before the widget is instantiated).
+    if saved:
+        st.session_state.setdefault("_trade_api_key", saved.get("api_key", ""))
+        st.session_state.setdefault("_trade_api_secret", saved.get("api_secret", ""))
+
     # NB: Not using st.form so changing Strategy reruns the param widgets
     # immediately. We use explicit keys for the secret inputs so we can
     # delete them from session_state after launch.
     c1, c2 = st.columns(2)
-    api_key = c1.text_input("Binance API key", type="password",
-                            autocomplete="off", key="_trade_api_key")
-    api_secret = c2.text_input("Binance API secret", type="password",
-                               autocomplete="off", key="_trade_api_secret")
+    api_key = c1.text_input(
+        "Binance API key", type="password", autocomplete="off",
+        key="_trade_api_key",
+    )
+    api_secret = c2.text_input(
+        "Binance API secret", type="password", autocomplete="off",
+        key="_trade_api_secret",
+    )
+    c1, c2 = st.columns([3, 1])
+    remember = c1.checkbox(
+        "💾 Remember keys on this machine",
+        value=bool(saved),
+        help=f"Saves to {_KEY_STORE} (mode 0600). Plaintext on disk — see warning above.",
+        key="_trade_remember_keys",
+    )
+    if saved and c2.button("🗑 Forget saved keys"):
+        if _delete_saved_keys():
+            for k in ("_trade_api_key", "_trade_api_secret"):
+                st.session_state.pop(k, None)
+            st.success(f"Removed {_KEY_STORE}.")
+            st.rerun()
 
     c1, c2, c3 = st.columns(3)
     f_market = c1.selectbox("Market", ["spot", "futures"],
@@ -324,6 +398,14 @@ def _render_trade_form():
         cmd.append("--allow-short")
     if f_live:
         cmd.append("--live")
+
+    # Persist (or delete) the key file BEFORE wiping locals.
+    if remember:
+        path = _save_keys(api_key, api_secret)
+        st.toast(f"🔐 Keys saved to {path} (mode 0600).", icon="🔐")
+    else:
+        if _delete_saved_keys():
+            st.toast(f"🗑 Removed {_KEY_STORE}.", icon="🗑")
 
     env = os.environ.copy()
     env["BINANCE_API_KEY"] = api_key
