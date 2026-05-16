@@ -61,12 +61,16 @@ def _build_exchange(market: str) -> ccxt.Exchange:
 
 
 def _fetch_bars(ex: ccxt.Exchange, symbol: str, tf: str, n: int):
+    """Return CLOSED bars only — the most recent (in-progress) bar from CCXT
+    is dropped so signals match the backtester (decide on close of bar t,
+    execute at open of bar t+1, no intra-bar flicker).
+    """
     import pandas as pd
-    # Pull enough bars for any indicator's lookback (default params max ~300).
     bars = ex.fetch_ohlcv(symbol, timeframe=tf, limit=max(n, 400))
     df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
     df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df.set_index("dt").drop(columns=["ts"]).astype(float)
+    df = df.set_index("dt").drop(columns=["ts"]).astype(float)
+    return df.iloc[:-1] if len(df) > 1 else df
 
 
 def _get_position_size(ex: ccxt.Exchange, market: str, symbol: str) -> float:
