@@ -72,7 +72,22 @@ with st.sidebar:
         ).strip()
     else:
         timeframe = tf_choice
-    lookback_days = st.slider("Lookback (days)", 90, 365 * 5, 365 * 2, step=30)
+    st.markdown("**Backtest period**")
+    today = datetime.now(timezone.utc).date()
+    default_start = today - timedelta(days=365 * 2)
+    min_start = today - timedelta(days=365 * 5)
+    date_col1, date_col2 = st.columns(2)
+    start_date = date_col1.date_input(
+        "Start", value=default_start, min_value=min_start, max_value=today - timedelta(days=1),
+    )
+    end_date = date_col2.date_input(
+        "End", value=today, min_value=start_date + timedelta(days=1), max_value=today,
+    )
+    if end_date <= start_date:
+        st.error("End date must be after start date.")
+        st.stop()
+    lookback_days = (end_date - start_date).days
+    st.caption(f"➡ Lookback: **{lookback_days} days** ({start_date} → {end_date}).")
 
     # Costs depend on selected symbol (single) or the market default (tournament)
     if mode.startswith("Single"):
@@ -198,15 +213,21 @@ if not run:
     st.stop()
 
 
-# Common: convert lookback to since_ms
-since_ms = int((datetime.now(timezone.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
+# Common: convert date range to since_ms / until_ts (UTC midnights)
+start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+end_dt = datetime.combine(end_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+since_ms = int(start_dt.timestamp() * 1000)
+
+
+def _trim_to_end(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df.index <= end_dt] if not df.empty else df
 
 
 # ===== Mode 1: Single strategy =====
 if mode.startswith("Single"):
     with st.spinner(f"Fetching {market} {symbol} {timeframe} candles…"):
         try:
-            df = fetch_ohlcv(symbol, timeframe=timeframe, since_ms=since_ms, market=market)
+            df = _trim_to_end(fetch_ohlcv(symbol, timeframe=timeframe, since_ms=since_ms, market=market))
         except Exception as e:
             st.error(f"Data fetch failed: {e}")
             st.stop()
@@ -303,7 +324,7 @@ else:
     prog = st.progress(0.0, text="Fetching data…")
     for i, sym in enumerate(symbols_selected, 1):
         try:
-            d = fetch_ohlcv(sym, timeframe=timeframe, since_ms=since_ms, market=market)
+            d = _trim_to_end(fetch_ohlcv(sym, timeframe=timeframe, since_ms=since_ms, market=market))
             if len(d) >= 100:
                 data[sym] = d
             else:
@@ -350,6 +371,46 @@ else:
     prog.empty()
 
     results = pd.DataFrame(rows)
+
+    # ===== Best (symbol × strategy) combination by profit =====
+    profit_results = results.dropna(subset=["Total Return"])
+    if not profit_results.empty:
+        best = profit_results.sort_values("Total Return", ascending=False).iloc[0]
+        st.subheader("🏆 Best (symbol × indicator) combination by total profit")
+        b1, b2, b3, b4, b5, b6 = st.columns(6)
+        b1.metric("Symbol", best["Symbol"])
+        b2.metric("Indicator", best["Strategy"])
+        b3.metric("Total Return", fmt_pct(best["Total Return"]),
+                  f"B&H: {fmt_pct(best['Buy & Hold Return'])}")
+        b4.metric("CAGR", fmt_pct(best["CAGR"]))
+        b5.metric("Sharpe", fmt_num(best["Sharpe"]))
+        b6.metric("Max DD", fmt_pct(best["Max DD"]))
+        eq = equity_curves.get((best["Symbol"], best["Strategy"]))
+        if eq is not None:
+            best_fig = go.Figure()
+            best_fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="Strategy",
+                                          line=dict(color="#2E86DE", width=2)))
+            bh_df = data[best["Symbol"]]
+            bh_eq = bh_df["close"] / bh_df["close"].iloc[0]
+            best_fig.add_trace(go.Scatter(x=bh_eq.index, y=bh_eq.values,
+                                          name="Buy & Hold",
+                                          line=dict(color="#888", width=1, dash="dot")))
+            best_fig.update_layout(height=340, margin=dict(t=20, b=20),
+                                   yaxis_title="Equity (start = 1.0)",
+                                   title=f"{best['Strategy']} on {best['Symbol']}")
+            st.plotly_chart(best_fig, use_container_width=True)
+
+        # Top-10 leaderboard of (symbol × indicator) pairs
+        with st.expander("Top 10 (symbol × indicator) combinations by profit", expanded=False):
+            top10 = profit_results.sort_values("Total Return", ascending=False).head(10)
+            top10_disp = top10[["Symbol", "Strategy", "Family", "Total Return", "CAGR",
+                                "Buy & Hold Return", "Sharpe", "Max DD", "Profit Factor",
+                                "Win Rate", "# Trades"]].copy()
+            for c in ["Total Return", "CAGR", "Buy & Hold Return", "Max DD", "Win Rate"]:
+                top10_disp[c] = top10_disp[c].map(fmt_pct)
+            for c in ["Sharpe", "Profit Factor"]:
+                top10_disp[c] = top10_disp[c].map(fmt_num)
+            st.dataframe(top10_disp, use_container_width=True, hide_index=True)
 
     # Per-symbol best
     st.subheader("🥇 Best strategy per symbol")
