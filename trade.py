@@ -169,8 +169,9 @@ def main() -> None:
                    help="Notional per position as %% of available USDT balance "
                         "(e.g. 25 = use 25%% of free USDT). Re-evaluated each entry.")
     p.add_argument("--leverage", type=float, default=1.0, help="Futures only.")
-    p.add_argument("--poll-seconds", type=int, default=0,
-                   help="Polling interval. 0 = use bar duration.")
+    p.add_argument("--bar-buffer-seconds", type=int, default=5,
+                   help="Seconds to wait after a bar boundary before fetching, "
+                        "to give the exchange time to close the bar (default 5).")
     p.add_argument("--dry-run", action="store_true", default=True,
                    help="Log orders instead of submitting (default ON).")
     p.add_argument("--live", action="store_true",
@@ -195,8 +196,16 @@ def main() -> None:
     if args.market == "futures":
         _set_leverage(ex, args.symbol, args.leverage)
 
-    tf_ms = ex.parse_timeframe(args.tf) * 1000
-    poll = args.poll_seconds if args.poll_seconds > 0 else max(30, tf_ms // 1000 // 4)
+    tf_seconds = ex.parse_timeframe(args.tf)
+
+    def _seconds_until_next_bar() -> int:
+        """Seconds until the next aligned bar boundary (UTC), plus a small
+        buffer so the exchange has finalised the bar. For tf=1h this fires
+        at :00:0X of each hour; for tf=15m at :00, :15, :30, :45.
+        """
+        now = int(time.time())
+        next_boundary = (now // tf_seconds + 1) * tf_seconds
+        return max(1, next_boundary - now + max(0, int(args.bar_buffer_seconds)))
 
     # Snapshot starting capital ONCE. In dry-run we never re-query the
     # exchange; sizing and PnL are tracked locally so the simulation is
@@ -224,7 +233,7 @@ def main() -> None:
     log(f"  allow_short = {args.allow_short}")
     log(f"  notional  = {args.notional_pct}% of capital  leverage = {args.leverage}x")
     log(f"  capital   = {initial_capital:.4f} USDT (snapshot){' [dry-run]' if dry_run else ''}")
-    log(f"  poll      = every {poll}s")
+    log(f"  schedule  = on bar close (tf {args.tf}, +{args.bar_buffer_seconds}s buffer)")
     log(f"  mode      = {'DRY-RUN' if dry_run else '⚠ LIVE TRADING ⚠'}")
     log("─" * 60)
 
@@ -313,9 +322,13 @@ def main() -> None:
         except Exception as e:
             log(f"ERROR: {type(e).__name__}: {e}")
 
-        # Sleep in small chunks so SIGTERM is responsive.
+        # Sleep until the next bar boundary, in 1s chunks so SIGTERM
+        # stays responsive.
+        wait = _seconds_until_next_bar()
+        next_at = datetime.now(timezone.utc) + timedelta(seconds=wait)
+        log(f"  sleeping {wait}s, next check ~ {next_at:%Y-%m-%d %H:%M:%S} UTC")
         slept = 0
-        while slept < poll and not stop_requested["v"]:
+        while slept < wait and not stop_requested["v"]:
             time.sleep(1); slept += 1
 
     log("Auto-trader stopped.")
