@@ -240,61 +240,70 @@ def _render_trade_form():
         "enabled but withdrawals disabled**, and IP-whitelist it.",
         icon="🔐",
     )
-    with st.form("trade_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        api_key = c1.text_input("Binance API key", type="password", autocomplete="off")
-        api_secret = c2.text_input("Binance API secret", type="password", autocomplete="off")
+    # NB: Not using st.form so changing Strategy reruns the param widgets
+    # immediately. We use explicit keys for the secret inputs so we can
+    # delete them from session_state after launch.
+    c1, c2 = st.columns(2)
+    api_key = c1.text_input("Binance API key", type="password",
+                            autocomplete="off", key="_trade_api_key")
+    api_secret = c2.text_input("Binance API secret", type="password",
+                               autocomplete="off", key="_trade_api_secret")
 
-        c1, c2, c3 = st.columns(3)
-        f_market = c1.selectbox("Market", ["spot", "futures"],
-                                index=0 if market == "spot" else 1)
-        f_symbol = c2.text_input("Symbol", value=symbols_selected[0] if symbols_selected else "BTC/USDT")
-        f_tf = c3.selectbox("Timeframe", BINANCE_TIMEFRAMES,
-                            index=BINANCE_TIMEFRAMES.index(timeframe) if timeframe in BINANCE_TIMEFRAMES else BINANCE_TIMEFRAMES.index("1h"))
+    c1, c2, c3 = st.columns(3)
+    f_market = c1.selectbox("Market", ["spot", "futures"],
+                            index=0 if market == "spot" else 1)
+    f_symbol = c2.text_input("Symbol", value=symbols_selected[0] if symbols_selected else "BTC/USDT")
+    f_tf = c3.selectbox("Timeframe", BINANCE_TIMEFRAMES,
+                        index=BINANCE_TIMEFRAMES.index(timeframe) if timeframe in BINANCE_TIMEFRAMES else BINANCE_TIMEFRAMES.index("1h"))
 
-        c1, c2, c3 = st.columns(3)
-        f_strat = c1.selectbox(
-            "Strategy", list(STRATEGIES.keys()),
-            index=(list(STRATEGIES.keys()).index(strat_name)
-                   if mode.startswith("Single") else 0),
-        )
-        f_notional_pct = c2.number_input(
-            "Notional per trade (% of free USDT)",
-            min_value=1.0, max_value=100.0, value=25.0, step=1.0,
-            help="Re-evaluated on each entry from the live USDT balance.",
-        )
-        f_lev = c3.number_input("Leverage (futures only)", min_value=1.0, max_value=25.0,
-                                value=float(leverage), step=1.0)
+    c1, c2, c3 = st.columns(3)
+    f_strat = c1.selectbox(
+        "Strategy", list(STRATEGIES.keys()),
+        index=(list(STRATEGIES.keys()).index(strat_name)
+               if mode.startswith("Single") else 0),
+        key="_trade_strat",
+    )
+    f_notional_pct = c2.number_input(
+        "Notional per trade (% of free USDT)",
+        min_value=1.0, max_value=100.0, value=25.0, step=1.0,
+        help="Re-evaluated on each entry from the live USDT balance.",
+    )
+    f_lev = c3.number_input("Leverage (futures only)", min_value=1.0, max_value=25.0,
+                            value=float(leverage), step=1.0)
 
-        spec_for_trade = STRATEGIES[f_strat]
-        st.caption(f"**Entry:** {spec_for_trade.entry_rule}")
-        param_vals: dict = {}
-        cols = st.columns(max(1, len(spec_for_trade.params)))
-        for (pname, (default, lo, hi, step)), col in zip(spec_for_trade.params.items(), cols):
-            if isinstance(default, float) or isinstance(step, float):
-                # source default from sidebar if same strat, else spec default
-                src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
-                param_vals[pname] = col.number_input(pname, float(lo), float(hi),
-                                                     float(src), float(step))
-            else:
-                src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
-                param_vals[pname] = col.number_input(pname, int(lo), int(hi),
-                                                     int(src), int(step))
+    spec_for_trade = STRATEGIES[f_strat]
+    st.caption(f"**Entry:** {spec_for_trade.entry_rule}")
+    param_vals: dict = {}
+    cols = st.columns(max(1, len(spec_for_trade.params)))
+    for (pname, (default, lo, hi, step)), col in zip(spec_for_trade.params.items(), cols):
+        # Key by strategy so switching strategy rebuilds widgets cleanly
+        # instead of reusing stale numeric values from another strategy.
+        wkey = f"_trade_param_{f_strat}_{pname}"
+        if isinstance(default, float) or isinstance(step, float):
+            src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
+            param_vals[pname] = col.number_input(pname, float(lo), float(hi),
+                                                 float(src), float(step), key=wkey)
+        else:
+            src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
+            param_vals[pname] = col.number_input(pname, int(lo), int(hi),
+                                                 int(src), int(step), key=wkey)
 
-        c1, c2 = st.columns(2)
-        f_allow_short = c1.checkbox("Allow shorting", value=bool(allow_short))
-        f_live = c2.checkbox(
-            "⚠️ LIVE — submit real orders",
-            value=False,
-            help="Unchecked = dry-run (default). Logs the orders it would place but submits nothing.",
-        )
+    c1, c2 = st.columns(2)
+    f_allow_short = c1.checkbox("Allow shorting", value=bool(allow_short))
+    f_live = c2.checkbox(
+        "⚠️ LIVE — submit real orders",
+        value=False,
+        help="Unchecked = dry-run (default). Logs the orders it would place but submits nothing.",
+    )
 
-        c1, c2 = st.columns(2)
-        submit = c1.form_submit_button("▶ Launch trader", type="primary",
-                                       use_container_width=True)
-        cancel = c2.form_submit_button("Cancel", use_container_width=True)
+    c1, c2 = st.columns(2)
+    submit = c1.button("▶ Launch trader", type="primary",
+                       use_container_width=True, key="_trade_submit")
+    cancel = c2.button("Cancel", use_container_width=True, key="_trade_cancel")
 
     if cancel:
+        for k in ("_trade_api_key", "_trade_api_secret"):
+            st.session_state.pop(k, None)
         st.session_state["show_trade_form"] = False
         st.rerun()
 
@@ -339,10 +348,12 @@ def _render_trade_form():
     finally:
         log_f.close()  # parent FD released; child has its own dup.
 
-    # ⚠ Wipe keys from local memory immediately. (Python doesn't guarantee
-    # the underlying string buffer is zeroed, but at least no reference is
-    # held by the app process beyond this point.)
+    # ⚠ Wipe keys from local memory and Streamlit session_state immediately.
+    # (Python doesn't guarantee the underlying string buffer is zeroed, but at
+    # least no reference is held by the app process beyond this point.)
     api_key = api_secret = None
+    for k in ("_trade_api_key", "_trade_api_secret"):
+        st.session_state.pop(k, None)
     del env  # the subprocess has its own copy now.
 
     st.session_state["trader"] = {
