@@ -99,17 +99,43 @@ def _free_usdt(ex: ccxt.Exchange, market: str) -> float:
         return 0.0
 
 
-def _qty_for_pct(ex: ccxt.Exchange, market: str, price: float, pct: float) -> float:
+def _qty_for_pct(ex: ccxt.Exchange, market: str, price: float, pct: float,
+                 leverage: float) -> float:
     if price <= 0 or pct <= 0:
         return 0.0
     usdt = _free_usdt(ex, market)
-    notional = usdt * pct / 100.0
+    margin = usdt * pct / 100.0
+    # On futures, the user puts up `margin` and controls `margin * leverage`
+    # of notional. On spot, leverage is always 1.
+    eff_lev = float(leverage) if market == "futures" else 1.0
+    notional = margin * eff_lev
     qty = notional / price
-    log(f"  sizing: free={usdt:.4f} USDT × {pct}% = notional {notional:.4f} → qty {qty:.8g}")
+    log(f"  sizing: free={usdt:.4f} USDT × {pct}% = margin {margin:.4f} "
+        f"× {eff_lev}x = notional {notional:.4f} → qty {qty:.8g}")
     return qty
 
 
-def _place_order(ex: ccxt.Exchange, symbol: str, side: str, qty: float, dry_run: bool) -> None:
+def _meets_minimums(ex: ccxt.Exchange, symbol: str, qty: float, price: float) -> bool:
+    m = ex.market(symbol)
+    limits = m.get("limits", {}) or {}
+    min_amt = (limits.get("amount") or {}).get("min")
+    min_cost = (limits.get("cost") or {}).get("min")
+    notional = qty * price
+    if min_amt is not None and qty < float(min_amt):
+        log(f"  SKIP entry: qty {qty:.8g} < market min amount {min_amt} "
+            f"(notional ≈ {notional:.2f}). Increase notional %% or leverage.")
+        return False
+    if min_cost is not None and notional < float(min_cost):
+        log(f"  SKIP entry: notional {notional:.4f} < market min cost {min_cost}. "
+            f"Increase notional %% or leverage.")
+        return False
+    return True
+
+
+def _place_order(ex: ccxt.Exchange, symbol: str, side: str, qty: float,
+                 price: float, dry_run: bool) -> None:
+    if not _meets_minimums(ex, symbol, qty, price):
+        return
     qty = ex.amount_to_precision(symbol, qty)
     if dry_run:
         log(f"DRY-RUN would submit MARKET {side.upper()} {qty} {symbol}")
@@ -212,14 +238,15 @@ def main() -> None:
                 if cur_side != target:
                     if cur_side != 0:
                         side = "sell" if cur_side == 1 else "buy"
-                        _place_order(ex, args.symbol, side, abs(current), dry_run)
+                        _place_order(ex, args.symbol, side, abs(current), price, dry_run)
                     if target != 0:
-                        qty = _qty_for_pct(ex, args.market, price, args.notional_pct)
+                        qty = _qty_for_pct(ex, args.market, price,
+                                           args.notional_pct, args.leverage)
                         if qty <= 0:
                             log("  WARN: zero sizing (no free USDT?); skipping entry.")
                         else:
                             side = "buy" if target == 1 else "sell"
-                            _place_order(ex, args.symbol, side, qty, dry_run)
+                            _place_order(ex, args.symbol, side, qty, price, dry_run)
                 last_bar_handled = last_bar
                 last_target = target
 
