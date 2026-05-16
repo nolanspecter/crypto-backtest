@@ -89,22 +89,38 @@ with st.sidebar:
     lookback_days = (end_date - start_date).days
     st.caption(f"➡ Lookback: **{lookback_days} days** ({start_date} → {end_date}).")
 
+    # Search filter narrows the list before the picker so users don't scroll.
+    search = st.text_input(
+        "🔎 Filter symbols",
+        value="", placeholder="e.g. BTC, sol, doge…",
+        help="Substring match against ticker or name (case-insensitive).",
+    ).strip().lower()
+    if search:
+        filtered_map = {
+            lbl: sym for lbl, sym in label_map.items() if search in lbl.lower()
+        }
+        if not filtered_map:
+            st.warning(f"No symbols match '{search}'. Showing full list.")
+            filtered_map = label_map
+    else:
+        filtered_map = label_map
+
     # Costs depend on selected symbol (single) or the market default (tournament)
     if mode.startswith("Single"):
-        labels = list(label_map.keys())
-        label = st.selectbox(f"Symbol ({len(universe)} available)", labels, index=0)
-        symbol = label_map[label]
+        labels = list(filtered_map.keys())
+        label = st.selectbox(f"Symbol ({len(filtered_map)} of {len(universe)})", labels, index=0)
+        symbol = filtered_map[label]
         symbols_selected: list[str] = [symbol]
     else:
-        defaults = list(label_map.keys())[:5]
+        defaults = list(filtered_map.keys())[:5]
         labels = st.multiselect(
-            f"Symbols ({len(universe)} available)",
-            list(label_map.keys()),
+            f"Symbols ({len(filtered_map)} of {len(universe)})",
+            list(filtered_map.keys()),
             default=defaults,
-            help="Pick 1+ symbols; all strategies will be run on each.",
+            help="Pick 1+ symbols. Use the filter above to narrow the list.",
         )
-        symbols_selected = [label_map[l] for l in labels]
-        symbol = symbols_selected[0] if symbols_selected else next(iter(label_map.values()))
+        symbols_selected = [filtered_map[l] for l in labels]
+        symbol = symbols_selected[0] if symbols_selected else next(iter(filtered_map.values()))
 
     st.header("Costs (live from Binance)")
     try:
