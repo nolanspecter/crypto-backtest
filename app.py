@@ -373,34 +373,61 @@ def _render_trade_form():
     st.rerun()
 
 
+_AUTO_REFRESH_CHOICES = {"Off": None, "1s": 1, "3s": 3, "5s": 5, "10s": 10}
+
+
 def _render_trader_status():
     t = st.session_state.get("trader")
     if not t:
         return
-    pid = int(t["pid"])
-    alive = _trader_alive(pid)
     st.subheader("📡 Auto-trader status")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("PID", str(pid))
-    c2.metric("Status", "🟢 running" if alive else "⚪ stopped")
-    c3.metric("Mode", t["mode"])
-    c4.metric("Symbol", t["symbol"])
-    c5.metric("Strategy", t["strategy"])
-    st.caption(f"Started: {t['started_at']}  ·  Market: {t['market']}  ·  TF: {t['tf']}  ·  Log: `{t['log_path']}`")
-    try:
-        tail = Path(t["log_path"]).read_text(errors="replace").splitlines()[-200:]
-        st.code("\n".join(tail) or "(no output yet)", language="text")
-    except FileNotFoundError:
-        st.info("Log file not yet created.")
-    cA, cB = st.columns(2)
-    if cA.button("🔄 Refresh log"):
-        st.rerun()
-    if alive and cB.button("■ Send SIGTERM"):
+    interval_label = st.selectbox(
+        "Auto-refresh", list(_AUTO_REFRESH_CHOICES.keys()),
+        index=2, key="_trader_refresh_interval",
+        help="How often to re-poll the log file and re-render this panel.",
+    )
+    interval = _AUTO_REFRESH_CHOICES[interval_label]
+
+    def _body():
+        pid = int(t["pid"])
+        alive = _trader_alive(pid)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("PID", str(pid))
+        c2.metric("Status", "🟢 running" if alive else "⚪ stopped")
+        c3.metric("Mode", t["mode"])
+        c4.metric("Symbol", t["symbol"])
+        c5.metric("Strategy", t["strategy"])
+        st.caption(
+            f"Started: {t['started_at']}  ·  Market: {t['market']}  ·  "
+            f"TF: {t['tf']}  ·  Log: `{t['log_path']}`  ·  "
+            f"Tail tip: `tail -f {t['log_path']}` in a local terminal"
+        )
         try:
-            os.kill(pid, signal.SIGTERM)
-            st.success("Sent SIGTERM.")
-        except Exception as e:
-            st.error(f"Failed: {e}")
+            tail = Path(t["log_path"]).read_text(errors="replace").splitlines()[-300:]
+            st.code("\n".join(tail) or "(no output yet)", language="text")
+        except FileNotFoundError:
+            st.info("Log file not yet created.")
+        cA, cB = st.columns(2)
+        if cA.button("🔄 Refresh now", key="_trader_refresh_now"):
+            st.rerun()
+        if alive and cB.button("■ Send SIGTERM", key="_trader_sigterm"):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                st.success("Sent SIGTERM.")
+            except Exception as e:
+                st.error(f"Failed: {e}")
+
+    # st.fragment(run_every=N) re-runs only this panel every N seconds without
+    # re-running the whole app. Falls back to a manual-refresh button on older
+    # Streamlit versions.
+    fragment = getattr(st, "fragment", None)
+    if fragment is None:
+        _body()
+        return
+    if interval is None:
+        fragment(_body)()
+    else:
+        fragment(_body, run_every=interval)()
 
 
 if st.session_state.get("show_trade_form"):

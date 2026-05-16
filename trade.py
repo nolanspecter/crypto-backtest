@@ -198,6 +198,23 @@ def main() -> None:
     tf_ms = ex.parse_timeframe(args.tf) * 1000
     poll = args.poll_seconds if args.poll_seconds > 0 else max(30, tf_ms // 1000 // 4)
 
+    # Snapshot starting capital ONCE. In dry-run we never re-query the
+    # exchange; sizing and PnL are tracked locally so the simulation is
+    # consistent and independent of any real balance changes.
+    initial_capital = _free_usdt(ex, args.market)
+    if initial_capital <= 0 and dry_run:
+        log(f"WARN: free USDT is 0 on dry-run start; using fallback capital 1000.")
+        initial_capital = 1000.0
+
+    # Verify we're starting flat on live, to keep the single-position invariant
+    # intact (matches backtest: one position open at a time).
+    if not dry_run:
+        existing = _get_position_size(ex, args.market, args.symbol)
+        if abs(existing) > 1e-12:
+            log(f"FATAL: existing {args.symbol} position {existing} on exchange; "
+                "trader assumes flat at start. Close manually and restart.")
+            sys.exit(3)
+
     log("─" * 60)
     log(f"Auto-trader starting")
     log(f"  market    = {args.market}")
@@ -205,13 +222,22 @@ def main() -> None:
     log(f"  timeframe = {args.tf}")
     log(f"  strategy  = {args.strategy}  params={ {k:v for k,v in params.items() if k != 'allow_short'} }")
     log(f"  allow_short = {args.allow_short}")
-    log(f"  notional  = {args.notional_pct}% of free USDT  leverage = {args.leverage}x")
+    log(f"  notional  = {args.notional_pct}% of capital  leverage = {args.leverage}x")
+    log(f"  capital   = {initial_capital:.4f} USDT (snapshot){' [dry-run]' if dry_run else ''}")
     log(f"  poll      = every {poll}s")
     log(f"  mode      = {'DRY-RUN' if dry_run else '⚠ LIVE TRADING ⚠'}")
     log("─" * 60)
 
+    # Local single-position state — the source of truth for "is a position open".
+    # Matches the backtester: position ∈ {-1, 0, +1}, no pyramiding, no overlap.
+    pos_side = 0          # -1 / 0 / +1
+    pos_qty = 0.0
+    pos_entry_px = 0.0
+    capital = initial_capital   # mutated only on close in dry-run
+    realized_pnl = 0.0
+    n_trades = 0
+
     last_bar_handled = None
-    last_target = 0
     stop_requested = {"v": False}
 
     def _sig(_sig, _frame):
@@ -231,28 +257,54 @@ def main() -> None:
 
             positions = spec.func(df, **params)
             target = int(positions.iloc[-1]) if not positions.empty else 0
-            current = _get_position_size(ex, args.market, args.symbol)
-            cur_side = 0 if abs(current) < 1e-12 else (1 if current > 0 else -1)
 
-            tag = "" if last_bar != last_bar_handled else "  (no new bar)"
-            log(f"bar={last_bar:%Y-%m-%d %H:%M} px={price:.6g} target={target} held={cur_side}{tag}")
+            new_bar = last_bar != last_bar_handled
+            unrealized = (price - pos_entry_px) * pos_qty * pos_side if pos_side else 0.0
+            tag = "" if new_bar else "  (no new bar)"
+            log(f"bar={last_bar:%Y-%m-%d %H:%M} px={price:.6g} target={target} "
+                f"held={pos_side} unrealized={unrealized:+.4f}{tag}")
 
-            if last_bar != last_bar_handled or target != last_target:
-                # Plan transitions: close-if-needed, then open-if-needed.
-                if cur_side != target:
-                    if cur_side != 0:
-                        side = "sell" if cur_side == 1 else "buy"
-                        _place_order(ex, args.symbol, side, abs(current), price, dry_run)
-                    if target != 0:
-                        qty = _qty_for_pct(ex, args.market, price,
-                                           args.notional_pct, args.leverage)
-                        if qty <= 0:
-                            log("  WARN: zero sizing (no free USDT?); skipping entry.")
-                        else:
-                            side = "buy" if target == 1 else "sell"
-                            _place_order(ex, args.symbol, side, qty, price, dry_run)
+            # Single-position state machine: only act when a new bar closes
+            # AND the target differs from the currently-held position.
+            if new_bar and target != pos_side:
+                # CLOSE existing position (if any) at this bar's price.
+                if pos_side != 0:
+                    close_side = "sell" if pos_side == 1 else "buy"
+                    pnl = (price - pos_entry_px) * pos_qty * pos_side
+                    realized_pnl += pnl
+                    capital += pnl
+                    log(f"CLOSE {('LONG' if pos_side == 1 else 'SHORT')} "
+                        f"qty={pos_qty:.8g} entry={pos_entry_px:.6g} "
+                        f"exit={price:.6g} pnl={pnl:+.4f} "
+                        f"capital={capital:.4f} realized={realized_pnl:+.4f}")
+                    _place_order(ex, args.symbol, close_side, pos_qty, price, dry_run)
+                    pos_side, pos_qty, pos_entry_px = 0, 0.0, 0.0
+
+                # OPEN a new position in the target direction (if any).
+                if target != 0:
+                    margin = capital * args.notional_pct / 100.0
+                    eff_lev = float(args.leverage) if args.market == "futures" else 1.0
+                    notional = margin * eff_lev
+                    qty = notional / price if price > 0 else 0.0
+                    log(f"  sizing: capital={capital:.4f} × {args.notional_pct}% "
+                        f"= margin {margin:.4f} × {eff_lev}x = notional {notional:.4f} → "
+                        f"qty {qty:.8g}")
+                    if qty <= 0:
+                        log("  WARN: zero sizing; skipping entry.")
+                    elif not _meets_minimums(ex, args.symbol, qty, price):
+                        # _meets_minimums already logged the SKIP reason.
+                        pass
+                    else:
+                        open_side = "buy" if target == 1 else "sell"
+                        _place_order(ex, args.symbol, open_side, qty, price, dry_run)
+                        pos_side, pos_qty, pos_entry_px = target, qty, price
+                        n_trades += 1
+                        log(f"OPEN {('LONG' if target == 1 else 'SHORT')} "
+                            f"qty={qty:.8g} @ {price:.6g}  "
+                            f"#{n_trades}  capital={capital:.4f}")
+
+            if new_bar:
                 last_bar_handled = last_bar
-                last_target = target
 
         except ccxt.NetworkError as e:
             log(f"NETWORK: {e}; will retry.")
