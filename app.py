@@ -258,8 +258,11 @@ def _render_trade_form():
             index=(list(STRATEGIES.keys()).index(strat_name)
                    if mode.startswith("Single") else 0),
         )
-        f_notional = c2.number_input("Notional per trade (USDT)", min_value=10.0,
-                                     max_value=1_000_000.0, value=50.0, step=10.0)
+        f_notional_pct = c2.number_input(
+            "Notional per trade (% of free USDT)",
+            min_value=1.0, max_value=100.0, value=25.0, step=1.0,
+            help="Re-evaluated on each entry from the live USDT balance.",
+        )
         f_lev = c3.number_input("Leverage (futures only)", min_value=1.0, max_value=25.0,
                                 value=float(leverage), step=1.0)
 
@@ -306,7 +309,7 @@ def _render_trade_form():
         sys.executable, "-u", "trade.py",
         "--market", f_market, "--symbol", f_symbol, "--tf", f_tf,
         "--strategy", f_strat, "--params", json.dumps(param_vals),
-        "--notional-usdt", str(f_notional), "--leverage", str(f_lev),
+        "--notional-pct", str(f_notional_pct), "--leverage", str(f_lev),
     ]
     if f_allow_short:
         cmd.append("--allow-short")

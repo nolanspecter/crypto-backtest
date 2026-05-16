@@ -21,7 +21,7 @@ Usage (env-only auth):
     BINANCE_API_KEY=... BINANCE_API_SECRET=... \
       python trade.py --market spot --symbol BTC/USDT --tf 1h \
                       --strategy "EMA Cross" --params '{"fast":20,"slow":50}' \
-                      --notional-usdt 50 --dry-run
+                      --notional-pct 25 --dry-run
 """
 from __future__ import annotations
 
@@ -87,10 +87,26 @@ def _get_position_size(ex: ccxt.Exchange, market: str, symbol: str) -> float:
         return 0.0
 
 
-def _qty_for_notional(price: float, notional_usdt: float) -> float:
-    if price <= 0:
+def _free_usdt(ex: ccxt.Exchange, market: str) -> float:
+    try:
+        bal = ex.fetch_balance()
+        if market == "futures":
+            return float(bal.get("USDT", {}).get("free")
+                         or bal.get("total", {}).get("USDT", 0.0))
+        return float(bal.get("USDT", {}).get("free", 0.0))
+    except Exception as e:
+        log(f"WARN: could not fetch USDT balance ({e}); assuming 0.")
         return 0.0
-    return notional_usdt / price
+
+
+def _qty_for_pct(ex: ccxt.Exchange, market: str, price: float, pct: float) -> float:
+    if price <= 0 or pct <= 0:
+        return 0.0
+    usdt = _free_usdt(ex, market)
+    notional = usdt * pct / 100.0
+    qty = notional / price
+    log(f"  sizing: free={usdt:.4f} USDT × {pct}% = notional {notional:.4f} → qty {qty:.8g}")
+    return qty
 
 
 def _place_order(ex: ccxt.Exchange, symbol: str, side: str, qty: float, dry_run: bool) -> None:
@@ -119,8 +135,9 @@ def main() -> None:
     p.add_argument("--strategy", required=True, help=f"One of: {', '.join(STRATEGIES)}")
     p.add_argument("--params", default="{}", help="JSON of strategy params.")
     p.add_argument("--allow-short", action="store_true")
-    p.add_argument("--notional-usdt", type=float, required=True,
-                   help="Notional in USDT per position (entry size).")
+    p.add_argument("--notional-pct", type=float, required=True,
+                   help="Notional per position as %% of available USDT balance "
+                        "(e.g. 25 = use 25%% of free USDT). Re-evaluated each entry.")
     p.add_argument("--leverage", type=float, default=1.0, help="Futures only.")
     p.add_argument("--poll-seconds", type=int, default=0,
                    help="Polling interval. 0 = use bar duration.")
@@ -158,7 +175,7 @@ def main() -> None:
     log(f"  timeframe = {args.tf}")
     log(f"  strategy  = {args.strategy}  params={ {k:v for k,v in params.items() if k != 'allow_short'} }")
     log(f"  allow_short = {args.allow_short}")
-    log(f"  notional  = {args.notional_usdt} USDT  leverage = {args.leverage}x")
+    log(f"  notional  = {args.notional_pct}% of free USDT  leverage = {args.leverage}x")
     log(f"  poll      = every {poll}s")
     log(f"  mode      = {'DRY-RUN' if dry_run else '⚠ LIVE TRADING ⚠'}")
     log("─" * 60)
@@ -197,9 +214,12 @@ def main() -> None:
                         side = "sell" if cur_side == 1 else "buy"
                         _place_order(ex, args.symbol, side, abs(current), dry_run)
                     if target != 0:
-                        qty = _qty_for_notional(price, args.notional_usdt)
-                        side = "buy" if target == 1 else "sell"
-                        _place_order(ex, args.symbol, side, qty, dry_run)
+                        qty = _qty_for_pct(ex, args.market, price, args.notional_pct)
+                        if qty <= 0:
+                            log("  WARN: zero sizing (no free USDT?); skipping entry.")
+                        else:
+                            side = "buy" if target == 1 else "sell"
+                            _place_order(ex, args.symbol, side, qty, dry_run)
                 last_bar_handled = last_bar
                 last_target = target
 
