@@ -321,11 +321,23 @@ def _render_trade_form():
     env["BINANCE_API_SECRET"] = api_secret
 
     log_path = _LOG_DIR / f"auto_trader_{int(datetime.now().timestamp())}.log"
+    # Open the log file, hand its FD to the child, then close it in the parent
+    # so Streamlit holds no reference. start_new_session detaches the child
+    # from Streamlit's process group / controlling terminal so SIGHUP / Ctrl-C
+    # on the Streamlit process won't propagate. stdin → /dev/null so the child
+    # never blocks on tty input.
     log_f = open(log_path, "w")
-    proc = subprocess.Popen(
-        cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT,
-        cwd=str(Path(__file__).parent), start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd, env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f, stderr=subprocess.STDOUT,
+            cwd=str(Path(__file__).parent),
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_f.close()  # parent FD released; child has its own dup.
 
     # ⚠ Wipe keys from local memory immediately. (Python doesn't guarantee
     # the underlying string buffer is zeroed, but at least no reference is
@@ -341,7 +353,12 @@ def _render_trade_form():
         "symbol": f_symbol, "strategy": f_strat, "market": f_market, "tf": f_tf,
     }
     st.session_state["show_trade_form"] = False
-    st.success(f"Trader launched (PID {proc.pid}). Log: `{log_path}`")
+    st.success(
+        f"Trader launched (PID {proc.pid}). Log: `{log_path}`\n\n"
+        "ℹ️ The trader runs in its own session — **closing or restarting "
+        "this Streamlit app will NOT stop it**. Use the **■ Stop running "
+        "trader** button (sidebar) or `kill " + str(proc.pid) + "` to stop."
+    )
     st.rerun()
 
 
