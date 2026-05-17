@@ -98,36 +98,89 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
     op = df["open"].astype(float)
     bar_ret_gross = op.pct_change().fillna(0.0)
 
-    # Fees are charged on |notional change|, NOT on capital at risk.
-    # `held` is in units of "fraction of equity in notional terms"
-    # (= sign × position_size × leverage), so |Δheld| is the notional turnover
-    # as a fraction of equity. Multiplying by the bps cost gives the per-bar
-    # cost as a fraction of equity. Example: 5% capital × 10× leverage = 0.5
-    # notional; opening costs 0.5 × 5 bps = 2.5 bps of equity per side.
+    # ── Cost accounting (still per-bar, since costs are paid at fills) ──────
+    # Fees are charged on |notional change|, NOT on capital at risk. `held`
+    # is in units of "fraction of equity in notional terms" so |Δheld| is
+    # the notional turnover. Example: 5% capital × 10× lev = 0.5 notional;
+    # opening costs 0.5 × 5 bps = 2.5 bps of equity per side.
     pos_change = held.diff().abs().fillna(held.abs())
     cost_per_turn = (fee_bps + slippage_bps) / 1e4
     costs = pos_change * cost_per_turn
-    total_notional_turnover = float(pos_change.sum())   # in units of equity
-    total_fee_drag = float(costs.sum())                  # fraction of equity lost to fees
+    total_notional_turnover = float(pos_change.sum())
+    total_fee_drag = float(costs.sum())
 
-    strat_ret = held * bar_ret_gross - costs
-    equity = (1.0 + strat_ret).cumprod()
-
+    # ── Trade ledger first (closed round-trips) ─────────────────────────────
     trades = _trades_from_positions(sign, op, bar_ret_gross)
     bpy = _bars_per_year(df.index)
 
-    # Metrics
+    # ── Equity, computed PER TRADE not per bar ──────────────────────────────
+    # Why: per-bar `prod(1 + L·r_t)` compounds leverage on every bar inside a
+    # trade, blowing up under L > 1. The realistic close-to-close P&L of a
+    # single trade is L × (exit/entry − 1), and only that should compound
+    # across trades. This matches TradingView's strategy.entry semantics and
+    # what an actual fill-by-fill broker statement looks like.
+    leverage_factor = float(position_size) * float(leverage)
+    cost_per_trade = 2.0 * leverage_factor * cost_per_turn  # entry + exit cost
+    if not trades.empty:
+        gross_per_trade = trades["return"].values * leverage_factor
+        net_per_trade = gross_per_trade - cost_per_trade
+        # Cannot lose more than 100% of equity (margin call hard cap).
+        net_per_trade = np.maximum(net_per_trade, -1.0)
+        compounded = np.cumprod(1.0 + net_per_trade)
+
+        # Bar-indexed equity that STEPS at each trade exit and is flat
+        # between trades (the chart becomes a stair-step curve — that's
+        # the realised-P&L view, no MTM wiggles).
+        equity = pd.Series(1.0, index=df.index)
+        for i, exit_time in enumerate(trades["exit_time"]):
+            equity.loc[equity.index >= exit_time] = float(compounded[i])
+
+        # Per-bar return series is zero except on exit bars; metrics that
+        # used to be bar-frequency (Sharpe/Sortino/Vol) now use the
+        # per-trade return distribution annualised by trades-per-year.
+        strat_ret = equity.pct_change().fillna(0.0)
+        n_years = max(
+            (df.index[-1] - df.index[0]).total_seconds() / (365.25 * 86400),
+            1e-9,
+        )
+        trades_per_year = len(net_per_trade) / n_years
+        trade_ret_std = float(np.std(net_per_trade, ddof=1)) if len(net_per_trade) > 1 else 0.0
+        trade_ret_mean = float(np.mean(net_per_trade))
+        # Annotate the ledger with the leveraged/net numbers the equity is built from.
+        trades = trades.copy()
+        trades["leveraged_return"] = gross_per_trade
+        trades["net_return"] = net_per_trade
+    else:
+        equity = pd.Series(1.0, index=df.index)
+        strat_ret = pd.Series(0.0, index=df.index)
+        trade_ret_std = 0.0
+        trade_ret_mean = 0.0
+        trades_per_year = 0.0
+
+    # Metrics — all derived from the per-trade compounded equity series.
     total_return = float(equity.iloc[-1] - 1)
-    n_years = len(df) / bpy if bpy > 0 else np.nan
-    cagr = float(equity.iloc[-1] ** (1 / n_years) - 1) if n_years and n_years > 0 else np.nan
-    vol = float(strat_ret.std() * np.sqrt(bpy))
-    sharpe = float(strat_ret.mean() / strat_ret.std() * np.sqrt(bpy)) if strat_ret.std() else np.nan
-    downside = strat_ret[strat_ret < 0].std()
-    sortino = float(strat_ret.mean() / downside * np.sqrt(bpy)) if downside else np.nan
+    n_years = (df.index[-1] - df.index[0]).total_seconds() / (365.25 * 86400)
+    cagr = (
+        float(equity.iloc[-1] ** (1 / n_years) - 1)
+        if n_years and n_years > 0 and equity.iloc[-1] > 0
+        else np.nan
+    )
+    # Per-trade vol / Sharpe / Sortino, annualised by trades/year.
+    if trades_per_year > 0 and trade_ret_std > 0:
+        vol = float(trade_ret_std * np.sqrt(trades_per_year))
+        sharpe = float(trade_ret_mean / trade_ret_std * np.sqrt(trades_per_year))
+        neg = (
+            trades["net_return"][trades["net_return"] < 0]
+            if "net_return" in trades.columns else pd.Series(dtype=float)
+        )
+        downside = float(neg.std(ddof=1)) if len(neg) > 1 else 0.0
+        sortino = float(trade_ret_mean / downside * np.sqrt(trades_per_year)) if downside else np.nan
+    else:
+        vol = sharpe = sortino = np.nan
     rollmax = equity.cummax()
     dd = (equity / rollmax - 1)
     max_dd = float(dd.min())
-    calmar = float(cagr / abs(max_dd)) if max_dd < 0 else np.nan
+    calmar = float(cagr / abs(max_dd)) if max_dd < 0 and not pd.isna(cagr) else np.nan
 
     bh_ret = float(df["close"].iloc[-1] / df["close"].iloc[0] - 1)
 
@@ -140,15 +193,18 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         bar_seconds = 0.0
 
     if not trades.empty:
-        wins = trades[trades["return"] > 0]["return"]
-        losses = trades[trades["return"] <= 0]["return"]
+        # Use the LEVERAGED + NET-OF-COSTS return so the stats match what the
+        # equity curve actually realises trade-by-trade.
+        ret_col = "net_return" if "net_return" in trades.columns else "return"
+        wins = trades[trades[ret_col] > 0][ret_col]
+        losses = trades[trades[ret_col] <= 0][ret_col]
         win_rate = float(len(wins) / len(trades))
         avg_win = float(wins.mean()) if len(wins) else 0.0
         avg_loss = float(losses.mean()) if len(losses) else 0.0
         gross_win = float(wins.sum())
         gross_loss = float(-losses.sum())
         profit_factor = float(gross_win / gross_loss) if gross_loss > 0 else np.inf
-        expectancy = float(trades["return"].mean())
+        expectancy = float(trades[ret_col].mean())
         rr_ratio = float(avg_win / abs(avg_loss)) if avg_loss < 0 else np.nan
         avg_hold_bars = float(trades["bars"].mean())
         avg_hold_seconds = avg_hold_bars * bar_seconds
