@@ -26,10 +26,20 @@ st.set_page_config(page_title="Crypto 4H Backtester", page_icon="📈", layout="
 st.title("📈 Crypto 4H Backtester")
 
 
+def _arg_after(tokens: list[str], flag: str) -> str:
+    """Return the token following `flag` in a shlex-split argv, or ''."""
+    try:
+        i = tokens.index(flag)
+        return tokens[i + 1] if i + 1 < len(tokens) else ""
+    except ValueError:
+        return ""
+
+
 def _scan_traders() -> list[dict]:
-    """Return a list of {pid, live, cmdline} for every running trade.py process
-    on this machine. Used to clean up orphans after Streamlit restarts.
+    """Return one dict per running trade.py process with parsed labels.
+    Used to clean up orphans after Streamlit restarts.
     """
+    import shlex
     try:
         out = subprocess.check_output(["ps", "-eo", "pid,command"], text=True)
     except Exception:
@@ -49,10 +59,18 @@ def _scan_traders() -> list[dict]:
         cmdline = parts[1]
         if "python" not in cmdline.lower() or "trade.py" not in cmdline:
             continue
+        try:
+            tokens = shlex.split(cmdline)
+        except ValueError:
+            tokens = cmdline.split()
         rows.append({
             "pid": pid,
-            "live": "--live" in cmdline,
+            "live": "--live" in tokens,
             "cmdline": cmdline,
+            "symbol": _arg_after(tokens, "--symbol"),
+            "strategy": _arg_after(tokens, "--strategy"),
+            "tf": _arg_after(tokens, "--tf"),
+            "market": _arg_after(tokens, "--market"),
         })
     return rows
 st.caption(
@@ -271,35 +289,63 @@ with st.sidebar:
     st.caption(
         f"Detected on host: **{len(dry_runs)}** dry-run · **{len(live_runs)}** live trader(s)."
     )
-    if dry_runs and st.button(
-        f"🗑 Kill all {len(dry_runs)} dry-run trader(s)",
-        use_container_width=True,
-        help="Sends SIGTERM to every running trade.py process that does NOT "
-             "have --live in its command line. Live traders are NOT touched.",
-    ):
-        killed, failed = [], []
-        for r in dry_runs:
-            try:
-                os.kill(int(r["pid"]), signal.SIGTERM)
-                killed.append(r["pid"])
-            except ProcessLookupError:
-                pass  # already gone
-            except Exception as e:
-                failed.append((r["pid"], str(e)))
-        msg = f"SIGTERM → {len(killed)} dry-run trader(s)."
-        if failed:
-            msg += f" Failed: {failed}"
-        st.success(msg) if not failed else st.warning(msg)
+
+    def _label(r: dict) -> str:
+        bits = [f"PID {r['pid']}"]
+        if r.get("symbol"):
+            bits.append(r["symbol"])
+        if r.get("strategy"):
+            bits.append(r["strategy"])
+        if r.get("tf"):
+            bits.append(r["tf"])
+        if r.get("market"):
+            bits.append(r["market"])
+        return " · ".join(bits)
+
+    def _kill(pid: int) -> tuple[bool, str]:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            return True, "ok"
+        except ProcessLookupError:
+            return True, "already exited"
+        except Exception as e:
+            return False, str(e)
+
+    if dry_runs:
+        with st.expander(f"🧪 {len(dry_runs)} dry-run trader(s)", expanded=True):
+            for r in dry_runs:
+                cA, cB = st.columns([5, 1])
+                cA.write(_label(r))
+                cA.caption(f"`{r['cmdline']}`")
+                if cB.button("■ Stop", key=f"_kill_dry_{r['pid']}"):
+                    ok, info = _kill(r["pid"])
+                    (st.success if ok else st.error)(f"PID {r['pid']}: {info}")
+                    st.rerun()
+            if st.button(
+                f"🗑 Kill all {len(dry_runs)} dry-run trader(s)",
+                use_container_width=True,
+                help="SIGTERM every dry-run trade.py process. Live traders are NOT touched.",
+            ):
+                killed, failed = [], []
+                for r in dry_runs:
+                    ok, info = _kill(r["pid"])
+                    (killed if ok else failed).append((r["pid"], info))
+                msg = f"SIGTERM → {len(killed)} dry-run trader(s)."
+                if failed:
+                    msg += f" Failed: {failed}"
+                (st.success if not failed else st.warning)(msg)
+                st.rerun()
+
     if live_runs:
         with st.expander(f"⚠️ {len(live_runs)} LIVE trader(s) running", expanded=False):
             for r in live_runs:
-                st.write(f"PID `{r['pid']}` — `{r['cmdline']}`")
-                if st.button(f"■ Stop PID {r['pid']}", key=f"_kill_live_{r['pid']}"):
-                    try:
-                        os.kill(int(r["pid"]), signal.SIGTERM)
-                        st.success(f"SIGTERM → {r['pid']}")
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
+                cA, cB = st.columns([5, 1])
+                cA.write(_label(r))
+                cA.caption(f"`{r['cmdline']}`")
+                if cB.button("■ Stop", key=f"_kill_live_{r['pid']}"):
+                    ok, info = _kill(r["pid"])
+                    (st.success if ok else st.error)(f"PID {r['pid']}: {info}")
+                    st.rerun()
 
 
 # ===== Live trader form & status panel =====
