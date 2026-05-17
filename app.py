@@ -232,6 +232,44 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to stop: {e}")
 
+    # Orphan cleanup — scans the OS for any trade.py processes regardless of
+    # whether this Streamlit session launched them.
+    running = _scan_traders()
+    dry_runs = [r for r in running if not r["live"]]
+    live_runs = [r for r in running if r["live"]]
+    st.caption(
+        f"Detected on host: **{len(dry_runs)}** dry-run · **{len(live_runs)}** live trader(s)."
+    )
+    if dry_runs and st.button(
+        f"🗑 Kill all {len(dry_runs)} dry-run trader(s)",
+        use_container_width=True,
+        help="Sends SIGTERM to every running trade.py process that does NOT "
+             "have --live in its command line. Live traders are NOT touched.",
+    ):
+        killed, failed = [], []
+        for r in dry_runs:
+            try:
+                os.kill(int(r["pid"]), signal.SIGTERM)
+                killed.append(r["pid"])
+            except ProcessLookupError:
+                pass  # already gone
+            except Exception as e:
+                failed.append((r["pid"], str(e)))
+        msg = f"SIGTERM → {len(killed)} dry-run trader(s)."
+        if failed:
+            msg += f" Failed: {failed}"
+        st.success(msg) if not failed else st.warning(msg)
+    if live_runs:
+        with st.expander(f"⚠️ {len(live_runs)} LIVE trader(s) running", expanded=False):
+            for r in live_runs:
+                st.write(f"PID `{r['pid']}` — `{r['cmdline']}`")
+                if st.button(f"■ Stop PID {r['pid']}", key=f"_kill_live_{r['pid']}"):
+                    try:
+                        os.kill(int(r["pid"]), signal.SIGTERM)
+                        st.success(f"SIGTERM → {r['pid']}")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+
 
 # ===== Live trader form & status panel =====
 _LOG_DIR = Path("/tmp")
@@ -267,6 +305,38 @@ def _save_keys(api_key: str, api_secret: str) -> Path:
     finally:
         os.close(fd)
     return _KEY_STORE
+
+
+def _scan_traders() -> list[dict]:
+    """Return a list of {pid, live, cmdline} for every running trade.py process
+    on this machine. Used to clean up orphans after Streamlit restarts.
+    """
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,command"], text=True)
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for line in out.splitlines()[1:]:
+        line = line.strip()
+        if not line or "trade.py" not in line or "grep" in line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cmdline = parts[1]
+        # Skip ourselves and any non-trader matches.
+        if "python" not in cmdline.lower() or "trade.py" not in cmdline:
+            continue
+        rows.append({
+            "pid": pid,
+            "live": "--live" in cmdline,
+            "cmdline": cmdline,
+        })
+    return rows
 
 
 def _delete_saved_keys() -> bool:
