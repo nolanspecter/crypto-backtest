@@ -322,14 +322,25 @@ def main() -> None:
         except Exception as e:
             log(f"ERROR: {type(e).__name__}: {e}")
 
-        # Sleep until the next bar boundary, in 1s chunks so SIGTERM
-        # stays responsive.
+        # Sleep until the next bar boundary using BOTH a monotonic deadline
+        # and the wall-clock target time. Why both:
+        #   - The old `slept += 1` loop counted iterations, not seconds, so
+        #     a stretched time.sleep(1) (e.g. laptop suspend mid-call) still
+        #     incremented the counter by 1 — drift accumulated each cycle.
+        #   - time.monotonic() freezes during system suspend on Linux, so a
+        #     monotonic-only deadline could still wait too long after wake.
+        #   - time.time() (wall clock) is the ground truth for "is the bar
+        #     boundary in the past yet"; we exit as soon as either says go.
         wait = _seconds_until_next_bar()
+        wall_deadline = time.time() + wait
+        mono_deadline = time.monotonic() + wait
         next_at = datetime.now(timezone.utc) + timedelta(seconds=wait)
         log(f"  sleeping {wait}s, next check ~ {next_at:%Y-%m-%d %H:%M:%S} UTC")
-        slept = 0
-        while slept < wait and not stop_requested["v"]:
-            time.sleep(1); slept += 1
+        while not stop_requested["v"]:
+            now = time.time()
+            if now >= wall_deadline or time.monotonic() >= mono_deadline:
+                break
+            time.sleep(min(1.0, max(0.1, wall_deadline - now)))
 
     log("Auto-trader stopped.")
 
