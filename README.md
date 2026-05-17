@@ -11,23 +11,6 @@ streamlit run app.py
 
 Then pick a symbol, a strategy, tweak parameters, and click **Run backtest**.
 
-### Configuration
-
-Per-machine defaults live in **[`config.toml`](config.toml)** — edit it once after
-cloning to pick your preferred market, default symbol, default strategy, sizing,
-log directory, and so on. Every value is also overridable in the UI at runtime;
-the config just controls the initial state.
-
-**Secrets are never read from `config.toml`.** Binance API keys come from either:
-- the Streamlit "🚀 Start trading" form, or
-- the `BINANCE_API_KEY` / `BINANCE_API_SECRET` environment variables when
-  running `trade.py` directly.
-
-If you tick "💾 Remember keys on this machine" in the trade form, the keys
-are written to the path configured under `[paths].key_store` (default
-`~/.crypto-backtest/binance.json`, mode `0600`) — outside the repo and
-never committed.
-
 ## What's included
 
 **Universe:** Top 100 coins by market cap (CoinGecko), filtered to those with a spot pair against `USDT` (or `USDC`/`BUSD`) on Binance.

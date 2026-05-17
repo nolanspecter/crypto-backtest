@@ -17,14 +17,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-import config
 from data import fetch_ohlcv, get_binance_fees, get_top_symbols
 from strategies import STRATEGIES
 from backtest import run_backtest
 
 
-st.set_page_config(page_title=config.APP_TITLE, page_icon=config.APP_PAGE_ICON, layout="wide")
-st.title(config.APP_TITLE)
+st.set_page_config(page_title="Crypto 4H Backtester", page_icon="📈", layout="wide")
+st.title("📈 Crypto 4H Backtester")
 
 
 def _find_log_for_pid(pid: int) -> str | None:
@@ -119,11 +118,7 @@ def fmt_duration(seconds: float) -> str:
 # ===== Sidebar (shared controls) =====
 with st.sidebar:
     st.header("Universe & Data")
-    market_label = st.radio(
-        "Market", ["Spot", "Futures (USDⓂ Perp)"],
-        index=1 if config.DEFAULT_MARKET == "futures" else 0,
-        horizontal=True,
-    )
+    market_label = st.radio("Market", ["Spot", "Futures (USDⓂ Perp)"], index=0, horizontal=True)
     market = "futures" if market_label.startswith("Futures") else "spot"
     quote = st.selectbox("Quote currency", ["USDT", "USDC", "BUSD"], 0,
                          disabled=(market == "futures"),
@@ -132,7 +127,7 @@ with st.sidebar:
         quote = "USDT"
     with st.spinner(f"Loading top-100 {market} universe…"):
         try:
-            universe = get_top_symbols(quote=quote, limit=config.UNIVERSE_SIZE, market=market)
+            universe = get_top_symbols(quote=quote, limit=100, market=market)
         except Exception as e:
             st.error(f"Failed to load universe: {e}")
             st.stop()
@@ -154,12 +149,11 @@ with st.sidebar:
 
     BINANCE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h",
                           "6h", "8h", "12h", "1d", "3d", "1w", "1M"]
-    _default_tf = config.DEFAULT_TIMEFRAME
-    _tf_index = BINANCE_TIMEFRAMES.index(_default_tf) if _default_tf in BINANCE_TIMEFRAMES else BINANCE_TIMEFRAMES.index("4h")
-    tf_choice = st.selectbox("Timeframe", BINANCE_TIMEFRAMES + ["Custom…"], index=_tf_index)
+    tf_choice = st.selectbox("Timeframe", BINANCE_TIMEFRAMES + ["Custom…"],
+                             index=BINANCE_TIMEFRAMES.index("4h"))
     if tf_choice == "Custom…":
         timeframe = st.text_input(
-            "Custom timeframe", value=_default_tf,
+            "Custom timeframe", value="4h",
             help="Any Binance-supported timeframe: 1m, 3m, 5m, 15m, 30m, 1h, "
                  "2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M.",
         ).strip()
@@ -167,7 +161,7 @@ with st.sidebar:
         timeframe = tf_choice
     st.markdown("**Backtest period**")
     today = datetime.now(timezone.utc).date()
-    default_start = today - timedelta(days=config.DEFAULT_LOOKBACK_DAYS)
+    default_start = today - timedelta(days=365 * 2)
     min_start = today - timedelta(days=365 * 5)
     date_col1, date_col2 = st.columns(2)
     start_date = date_col1.date_input(
@@ -185,20 +179,14 @@ with st.sidebar:
     # Costs depend on selected symbol (single) or the market default (tournament)
     if mode.startswith("Single"):
         labels = list(label_map.keys())
-        # Pre-select the configured default symbol if it's in the universe.
-        _default_idx = next(
-            (i for i, sym in enumerate(label_map.values())
-             if sym == config.DEFAULT_SYMBOL),
-            0,
-        )
         label = st.selectbox(
-            f"Symbol ({len(universe)} available)", labels, index=_default_idx,
+            f"Symbol ({len(universe)} available)", labels, index=0,
             help="Click to open, then type to search (e.g. BTC, sol, doge).",
         )
         symbol = label_map[label]
         symbols_selected: list[str] = [symbol]
     else:
-        defaults = list(label_map.keys())[:config.TOURNAMENT_DEFAULT_N]
+        defaults = list(label_map.keys())[:5]
         labels = st.multiselect(
             f"Symbols ({len(universe)} available)",
             list(label_map.keys()),
@@ -257,20 +245,16 @@ with st.sidebar:
         position_size = risk_pct / 100.0
         st.caption(f"➡ Notional per trade: **{position_size * 100:.1f}%** of equity.")
 
-    allow_short = st.checkbox("Allow shorting", value=config.TRADER_ALLOW_SHORT)
+    allow_short = st.checkbox("Allow shorting", value=False)
 
     # Defaults so the live-trade form works in every mode
-    _strategy_keys = list(STRATEGIES.keys())
-    strat_name: str = config.DEFAULT_STRATEGY if config.DEFAULT_STRATEGY in STRATEGIES else _strategy_keys[0]
+    strat_name: str = next(iter(STRATEGIES))
     params: dict = {"allow_short": allow_short}
 
     # Strategy picker only in single mode
     if mode.startswith("Single"):
         st.header("Strategy")
-        strat_name = st.selectbox(
-            "Strategy", _strategy_keys,
-            index=_strategy_keys.index(strat_name),
-        )
+        strat_name = st.selectbox("Strategy", list(STRATEGIES.keys()))
         spec = STRATEGIES[strat_name]
         st.caption(f"**{spec.family}** — {spec.description}")
         with st.expander("Entry / Exit / TP·SL rules", expanded=True):
@@ -291,9 +275,11 @@ with st.sidebar:
     else:
         st.header("Strategies")
         st.caption("All strategies run with **default parameters**.")
-        _rank_choices = ["Total Return", "CAGR", "Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"]
-        _rank_idx = _rank_choices.index(config.TOURNAMENT_RANK_METRIC) if config.TOURNAMENT_RANK_METRIC in _rank_choices else 0
-        rank_metric = st.selectbox("Rank by", _rank_choices, index=_rank_idx)
+        rank_metric = st.selectbox(
+            "Rank by",
+            ["Total Return", "CAGR", "Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"],
+            index=0,
+        )
         run = st.button("▶ Run tournament", type="primary", use_container_width=True)
 
     st.divider()
@@ -386,8 +372,8 @@ with st.sidebar:
 
 
 # ===== Live trader form & status panel =====
-_LOG_DIR = config.LOG_DIR
-_KEY_STORE = config.KEY_STORE
+_LOG_DIR = Path("/tmp")
+_KEY_STORE = Path.home() / ".crypto-backtest" / "binance.json"
 
 
 def _load_saved_keys() -> dict:
@@ -490,45 +476,27 @@ def _render_trade_form():
             st.success(f"Removed {_KEY_STORE}.")
             st.rerun()
 
-    # Prefer the active sidebar selection if it's a Binance pair, otherwise
-    # fall back to the configured trader default.
-    _form_default_symbol = (
-        symbols_selected[0] if symbols_selected else config.TRADER_SYMBOL
-    )
-    _form_default_market = market if market in ("spot", "futures") else config.TRADER_MARKET
-    _form_default_tf = timeframe if timeframe in BINANCE_TIMEFRAMES else config.TRADER_TIMEFRAME
-
     c1, c2, c3 = st.columns(3)
     f_market = c1.selectbox("Market", ["spot", "futures"],
-                            index=0 if _form_default_market == "spot" else 1)
-    f_symbol = c2.text_input("Symbol", value=_form_default_symbol)
-    f_tf = c3.selectbox(
-        "Timeframe", BINANCE_TIMEFRAMES,
-        index=BINANCE_TIMEFRAMES.index(_form_default_tf) if _form_default_tf in BINANCE_TIMEFRAMES else BINANCE_TIMEFRAMES.index(config.TRADER_TIMEFRAME),
-    )
+                            index=0 if market == "spot" else 1)
+    f_symbol = c2.text_input("Symbol", value=symbols_selected[0] if symbols_selected else "BTC/USDT")
+    f_tf = c3.selectbox("Timeframe", BINANCE_TIMEFRAMES,
+                        index=BINANCE_TIMEFRAMES.index(timeframe) if timeframe in BINANCE_TIMEFRAMES else BINANCE_TIMEFRAMES.index("1h"))
 
     c1, c2, c3 = st.columns(3)
-    _strat_keys = list(STRATEGIES.keys())
-    _form_default_strat = (
-        strat_name if mode.startswith("Single")
-        else (config.TRADER_STRATEGY if config.TRADER_STRATEGY in STRATEGIES else _strat_keys[0])
-    )
     f_strat = c1.selectbox(
-        "Strategy", _strat_keys,
-        index=_strat_keys.index(_form_default_strat),
+        "Strategy", list(STRATEGIES.keys()),
+        index=(list(STRATEGIES.keys()).index(strat_name)
+               if mode.startswith("Single") else 0),
         key="_trade_strat",
     )
     f_notional_pct = c2.number_input(
         "Notional per trade (% of free USDT)",
-        min_value=1.0, max_value=100.0,
-        value=float(config.TRADER_NOTIONAL_PCT), step=1.0,
+        min_value=1.0, max_value=100.0, value=25.0, step=1.0,
         help="Re-evaluated on each entry from the live USDT balance.",
     )
-    f_lev = c3.number_input(
-        "Leverage (futures only)", min_value=1.0, max_value=25.0,
-        value=float(leverage) if leverage > 1 else float(config.TRADER_LEVERAGE),
-        step=1.0,
-    )
+    f_lev = c3.number_input("Leverage (futures only)", min_value=1.0, max_value=25.0,
+                            value=float(leverage), step=1.0)
 
     spec_for_trade = STRATEGIES[f_strat]
     st.caption(f"**Entry:** {spec_for_trade.entry_rule}")
@@ -538,27 +506,17 @@ def _render_trade_form():
         # Key by strategy so switching strategy rebuilds widgets cleanly
         # instead of reusing stale numeric values from another strategy.
         wkey = f"_trade_param_{f_strat}_{pname}"
-        # Priority for the initial value:
-        #   1. sidebar params (if same strategy is selected up there)
-        #   2. config.TRADER_STRATEGY_PARAMS (if this is the configured trader strategy)
-        #   3. the strategy's own default
-        cfg_param = (
-            config.TRADER_STRATEGY_PARAMS.get(pname)
-            if f_strat == config.TRADER_STRATEGY else None
-        )
         if isinstance(default, float) or isinstance(step, float):
-            src = (params.get(pname) if mode.startswith("Single") and strat_name == f_strat
-                   else (cfg_param if cfg_param is not None else default))
+            src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
             param_vals[pname] = col.number_input(pname, float(lo), float(hi),
                                                  float(src), float(step), key=wkey)
         else:
-            src = (params.get(pname) if mode.startswith("Single") and strat_name == f_strat
-                   else (cfg_param if cfg_param is not None else default))
+            src = params.get(pname) if mode.startswith("Single") and strat_name == f_strat else default
             param_vals[pname] = col.number_input(pname, int(lo), int(hi),
                                                  int(src), int(step), key=wkey)
 
     c1, c2 = st.columns(2)
-    f_allow_short = c1.checkbox("Allow shorting", value=bool(allow_short or config.TRADER_ALLOW_SHORT))
+    f_allow_short = c1.checkbox("Allow shorting", value=bool(allow_short))
     f_live = c2.checkbox(
         "⚠️ LIVE — submit real orders",
         value=False,
@@ -660,9 +618,7 @@ def _render_trader_status():
     st.subheader("📡 Auto-trader status")
     interval_label = st.selectbox(
         "Auto-refresh", list(_AUTO_REFRESH_CHOICES.keys()),
-        index=list(_AUTO_REFRESH_CHOICES.keys()).index(config.DEFAULT_AUTO_REFRESH)
-        if config.DEFAULT_AUTO_REFRESH in _AUTO_REFRESH_CHOICES else 2,
-        key="_trader_refresh_interval",
+        index=2, key="_trader_refresh_interval",
         help="How often to re-poll the log file and re-render this panel.",
     )
     interval = _AUTO_REFRESH_CHOICES[interval_label]
@@ -682,7 +638,7 @@ def _render_trader_status():
             f"Tail tip: `tail -f {t['log_path']}` in a local terminal"
         )
         try:
-            tail = Path(t["log_path"]).read_text(errors="replace").splitlines()[-config.LOG_TAIL_LINES:]
+            tail = Path(t["log_path"]).read_text(errors="replace").splitlines()[-300:]
             st.code("\n".join(tail) or "(no output yet)", language="text")
         except FileNotFoundError:
             st.info("Log file not yet created.")
@@ -730,9 +686,7 @@ def _render_focused_log():
         st.rerun()
     refresh_label = cB.selectbox(
         "Auto-refresh", list(_AUTO_REFRESH_CHOICES.keys()),
-        index=list(_AUTO_REFRESH_CHOICES.keys()).index(config.DEFAULT_AUTO_REFRESH)
-        if config.DEFAULT_AUTO_REFRESH in _AUTO_REFRESH_CHOICES else 2,
-        key=f"_focused_refresh_{pid}",
+        index=2, key=f"_focused_refresh_{pid}",
     )
     interval = _AUTO_REFRESH_CHOICES[refresh_label]
 
@@ -752,7 +706,7 @@ def _render_focused_log():
             return
         st.caption(f"`{log_path}`  ·  `tail -f {log_path}`")
         try:
-            tail = Path(log_path).read_text(errors="replace").splitlines()[-config.LOG_TAIL_LINES:]
+            tail = Path(log_path).read_text(errors="replace").splitlines()[-300:]
             st.code("\n".join(tail) or "(no output yet)", language="text")
         except FileNotFoundError:
             st.info("Log file not found on disk.")
