@@ -131,6 +131,14 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
 
     bh_ret = float(df["close"].iloc[-1] / df["close"].iloc[0] - 1)
 
+    # Median bar duration in seconds (e.g. 4h bars → 14400). Used to convert
+    # "bars held" into wall-clock time so the average hold reads in hours/days
+    # regardless of timeframe.
+    if len(df.index) >= 2:
+        bar_seconds = float(np.median(np.diff(df.index.view("i8")) / 1e9))
+    else:
+        bar_seconds = 0.0
+
     if not trades.empty:
         wins = trades[trades["return"] > 0]["return"]
         losses = trades[trades["return"] <= 0]["return"]
@@ -142,9 +150,18 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         profit_factor = float(gross_win / gross_loss) if gross_loss > 0 else np.inf
         expectancy = float(trades["return"].mean())
         rr_ratio = float(avg_win / abs(avg_loss)) if avg_loss < 0 else np.nan
+        avg_hold_bars = float(trades["bars"].mean())
+        avg_hold_seconds = avg_hold_bars * bar_seconds
+        # Per-side averages, useful when allow_short is on
+        long_trades = trades[trades["side"] == "long"]
+        short_trades = trades[trades["side"] == "short"]
+        avg_hold_long_bars = float(long_trades["bars"].mean()) if not long_trades.empty else np.nan
+        avg_hold_short_bars = float(short_trades["bars"].mean()) if not short_trades.empty else np.nan
     else:
         win_rate = avg_win = avg_loss = expectancy = 0.0
         profit_factor = rr_ratio = np.nan
+        avg_hold_bars = avg_hold_seconds = np.nan
+        avg_hold_long_bars = avg_hold_short_bars = np.nan
 
     exposure = float((held != 0).mean())
 
@@ -165,6 +182,10 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         "Avg Loss": avg_loss,
         "R:R": rr_ratio,
         "Expectancy / Trade": expectancy,
+        "Avg Hold (bars)": avg_hold_bars,
+        "Avg Hold (seconds)": avg_hold_seconds,
+        "Avg Hold Long (bars)": avg_hold_long_bars,
+        "Avg Hold Short (bars)": avg_hold_short_bars,
     }
 
     metrics["Position Size"] = float(position_size)

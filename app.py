@@ -34,6 +34,21 @@ def fmt_pct(x): return "—" if pd.isna(x) else f"{x*100:.2f}%"
 def fmt_num(x): return "—" if pd.isna(x) else f"{x:.2f}"
 
 
+def fmt_duration(seconds: float) -> str:
+    """Human-readable duration: seconds → '3.2h', '1.5d', '2.1w'."""
+    if seconds is None or pd.isna(seconds) or seconds <= 0:
+        return "—"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    if seconds < 86400:
+        return f"{seconds/3600:.1f}h"
+    if seconds < 7 * 86400:
+        return f"{seconds/86400:.1f}d"
+    return f"{seconds/86400/7:.1f}w"
+
+
 # ===== Sidebar (shared controls) =====
 with st.sidebar:
     st.header("Universe & Data")
@@ -578,7 +593,7 @@ if mode.startswith("Single"):
     c3.metric("Sharpe", fmt_num(m["Sharpe"]))
     c4.metric("Max DD", fmt_pct(m["Max Drawdown"]))
     c5.metric("# Trades", str(m["# Trades"]))
-    c6, c7, c8, c9, c10, c11 = st.columns(6)
+    c6, c7, c8, c9, c10, c11, c12 = st.columns(7)
     c6.metric("Sortino", fmt_num(m["Sortino"]))
     c7.metric("Calmar", fmt_num(m["Calmar"]))
     c8.metric("Win Rate", fmt_pct(m["Win Rate"]))
@@ -586,6 +601,13 @@ if mode.startswith("Single"):
     c10.metric("R:R", fmt_num(m["R:R"]),
                f"avg win {fmt_pct(m['Avg Win'])} / loss {fmt_pct(m['Avg Loss'])}")
     c11.metric("Exposure", fmt_pct(m["Exposure"]))
+    avg_hold = m.get("Avg Hold (seconds)", float("nan"))
+    avg_bars = m.get("Avg Hold (bars)", float("nan"))
+    c12.metric(
+        "Avg Hold",
+        fmt_duration(avg_hold),
+        f"{avg_bars:.1f} bars" if not pd.isna(avg_bars) else None,
+    )
 
     bh_equity = (df["close"] / df["close"].iloc[0])
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
@@ -691,6 +713,7 @@ else:
                     "Profit Factor": m["Profit Factor"], "R:R": m["R:R"],
                     "Win Rate": m["Win Rate"],
                     "# Trades": m["# Trades"], "Exposure": m["Exposure"],
+                    "Avg Hold": m.get("Avg Hold (seconds)", float("nan")),
                 })
                 equity_curves[(sym, sname)] = res.equity
             except Exception as e:
@@ -733,11 +756,12 @@ else:
             top10 = profit_results.sort_values("Total Return", ascending=False).head(10)
             top10_disp = top10[["Symbol", "Strategy", "Family", "Total Return", "CAGR",
                                 "Buy & Hold Return", "Sharpe", "Max DD", "Profit Factor",
-                                "Win Rate", "# Trades"]].copy()
+                                "Win Rate", "# Trades", "Avg Hold"]].copy()
             for c in ["Total Return", "CAGR", "Buy & Hold Return", "Max DD", "Win Rate"]:
                 top10_disp[c] = top10_disp[c].map(fmt_pct)
             for c in ["Sharpe", "Profit Factor"]:
                 top10_disp[c] = top10_disp[c].map(fmt_num)
+            top10_disp["Avg Hold"] = top10_disp["Avg Hold"].map(fmt_duration)
             st.dataframe(top10_disp, use_container_width=True, hide_index=True)
 
     # Per-symbol best
@@ -746,12 +770,13 @@ else:
                           .groupby("Symbol", as_index=False).first())
     show_cols = ["Symbol", "Strategy", "Family", "Total Return", "CAGR",
                  "Buy & Hold Return", "Sharpe", "Max DD", "Profit Factor", "R:R",
-                 "Win Rate", "# Trades"]
+                 "Win Rate", "# Trades", "Avg Hold"]
     disp = best_per_sym[show_cols].copy()
     for c in ["Total Return", "CAGR", "Buy & Hold Return", "Max DD", "Win Rate"]:
         disp[c] = disp[c].map(fmt_pct)
     for c in ["Sharpe", "Profit Factor", "R:R"]:
         disp[c] = disp[c].map(fmt_num)
+    disp["Avg Hold"] = disp["Avg Hold"].map(fmt_duration)
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
     # Aggregate across symbols
@@ -760,7 +785,8 @@ else:
                   .agg({"Total Return": "mean", "CAGR": "mean",
                         "Sharpe": "mean", "Sortino": "mean", "Calmar": "mean",
                         "Max DD": "mean", "Profit Factor": "mean", "R:R": "mean",
-                        "Win Rate": "mean", "# Trades": "mean"})
+                        "Win Rate": "mean", "# Trades": "mean",
+                        "Avg Hold": "mean"})
                   .sort_values(rank_metric, ascending=False))
     agg_disp = agg.copy()
     for c in ["Total Return", "CAGR", "Max DD", "Win Rate"]:
@@ -768,6 +794,7 @@ else:
     for c in ["Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"]:
         agg_disp[c] = agg_disp[c].map(fmt_num)
     agg_disp["# Trades"] = agg_disp["# Trades"].round(0).astype(int)
+    agg_disp["Avg Hold"] = agg_disp["Avg Hold"].map(fmt_duration)
     st.dataframe(agg_disp, use_container_width=True, hide_index=True)
 
     winner = agg.iloc[0]["Strategy"]
