@@ -1,9 +1,0 @@
-__pycache__/
-*.pyc
-.git
-.gitignore
-.DS_Store
-.venv/
-venv/
-*.log
-.fly/
