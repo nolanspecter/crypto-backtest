@@ -26,6 +26,23 @@ st.set_page_config(page_title="Crypto 4H Backtester", page_icon="📈", layout="
 st.title("📈 Crypto 4H Backtester")
 
 
+def _find_log_for_pid(pid: int) -> str | None:
+    """Best-effort: inspect the PID's open file descriptors via lsof and
+    return the auto-trader log path it's currently writing to (if any).
+    """
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-p", str(pid), "-Fn"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if line.startswith("n") and "auto_trader_" in line and line.endswith(".log"):
+            return line[1:]
+    return None
+
+
 def _arg_after(tokens: list[str], flag: str) -> str:
     """Return the token following `flag` in a shlex-split argv, or ''."""
     try:
@@ -314,10 +331,13 @@ with st.sidebar:
     if dry_runs:
         with st.expander(f"🧪 {len(dry_runs)} dry-run trader(s)", expanded=True):
             for r in dry_runs:
-                cA, cB = st.columns([5, 1])
+                cA, cB, cC = st.columns([5, 1, 1])
                 cA.write(_label(r))
                 cA.caption(f"`{r['cmdline']}`")
-                if cB.button("■ Stop", key=f"_kill_dry_{r['pid']}"):
+                if cB.button("📄 Log", key=f"_log_dry_{r['pid']}"):
+                    st.session_state["focused_pid"] = r["pid"]
+                    st.rerun()
+                if cC.button("■ Stop", key=f"_kill_dry_{r['pid']}"):
                     ok, info = _kill(r["pid"])
                     (st.success if ok else st.error)(f"PID {r['pid']}: {info}")
                     st.rerun()
@@ -339,10 +359,13 @@ with st.sidebar:
     if live_runs:
         with st.expander(f"⚠️ {len(live_runs)} LIVE trader(s) running", expanded=False):
             for r in live_runs:
-                cA, cB = st.columns([5, 1])
+                cA, cB, cC = st.columns([5, 1, 1])
                 cA.write(_label(r))
                 cA.caption(f"`{r['cmdline']}`")
-                if cB.button("■ Stop", key=f"_kill_live_{r['pid']}"):
+                if cB.button("📄 Log", key=f"_log_live_{r['pid']}"):
+                    st.session_state["focused_pid"] = r["pid"]
+                    st.rerun()
+                if cC.button("■ Stop", key=f"_kill_live_{r['pid']}"):
                     ok, info = _kill(r["pid"])
                     (st.success if ok else st.error)(f"PID {r['pid']}: {info}")
                     st.rerun()
@@ -642,9 +665,65 @@ def _render_trader_status():
         fragment(_body, run_every=interval)()
 
 
+def _render_focused_log():
+    """Show the log of a trader that was picked from the orphan-cleanup list
+    (the one that didn't necessarily come from this Streamlit session).
+    """
+    pid = st.session_state.get("focused_pid")
+    if not pid:
+        return
+    pid = int(pid)
+    # If this is the trader we already track, the dedicated status panel
+    # already shows it — no need to duplicate.
+    t = st.session_state.get("trader")
+    if t and int(t.get("pid", 0)) == pid:
+        return
+
+    st.subheader(f"📄 Trader log — PID {pid}")
+    cA, cB, cC = st.columns([1, 1, 4])
+    if cA.button("✖ Close", key=f"_close_log_{pid}"):
+        st.session_state.pop("focused_pid", None)
+        st.rerun()
+    refresh_label = cB.selectbox(
+        "Auto-refresh", list(_AUTO_REFRESH_CHOICES.keys()),
+        index=2, key=f"_focused_refresh_{pid}",
+    )
+    interval = _AUTO_REFRESH_CHOICES[refresh_label]
+
+    def _body():
+        alive = _trader_alive(pid)
+        log_path = _find_log_for_pid(pid)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("PID", str(pid))
+        c2.metric("Status", "🟢 running" if alive else "⚪ stopped")
+        c3.metric("Log", "found" if log_path else "—")
+        if not log_path:
+            st.info(
+                "Could not locate this trader's log via `lsof`. The process "
+                "may have already detached its log file or `lsof` isn't "
+                "installed. Try `ls -lt /tmp/auto_trader_*.log` in a shell."
+            )
+            return
+        st.caption(f"`{log_path}`  ·  `tail -f {log_path}`")
+        try:
+            tail = Path(log_path).read_text(errors="replace").splitlines()[-300:]
+            st.code("\n".join(tail) or "(no output yet)", language="text")
+        except FileNotFoundError:
+            st.info("Log file not found on disk.")
+
+    fragment = getattr(st, "fragment", None)
+    if fragment is None:
+        _body()
+    elif interval is None:
+        fragment(_body)()
+    else:
+        fragment(_body, run_every=interval)()
+
+
 if st.session_state.get("show_trade_form"):
     _render_trade_form()
 _render_trader_status()
+_render_focused_log()
 
 
 # ===== Landing screen =====
