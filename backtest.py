@@ -7,9 +7,14 @@ import numpy as np
 import pandas as pd
 
 
+# Starting capital used for every backtest, in quote currency (USDT).
+# All equity curves, trade $-PnL, and dollar metrics are expressed off this.
+INITIAL_CAPITAL: float = 1000.0
+
+
 @dataclass
 class BacktestResult:
-    equity: pd.Series              # equity curve, starting at 1.0
+    equity: pd.Series              # equity curve in USDT, starts at INITIAL_CAPITAL
     returns: pd.Series             # per-bar strategy returns (net of costs)
     positions: pd.Series           # position held during each bar (-1/0/1)
     trades: pd.DataFrame           # one row per round-trip
@@ -130,12 +135,17 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         # it negative).
         trades["return"] = (trades["return"] * leverage_factor - cost_per_trade).clip(lower=-1.0)
 
-        compounded = (1.0 + trades["return"]).cumprod().values
+        # Compound the per-trade returns off the configured starting capital.
+        # equity_after_trade_i = INITIAL_CAPITAL × ∏_{j ≤ i} (1 + return_j)
+        compounded = INITIAL_CAPITAL * (1.0 + trades["return"]).cumprod().values
+        # Dollar P&L of each trade = equity_after − equity_before.
+        equity_before = np.concatenate([[INITIAL_CAPITAL], compounded[:-1]])
+        trades["pnl_usdt"] = compounded - equity_before
+        trades["equity_after"] = compounded
 
-        # Bar-indexed equity that STEPS at each trade exit and is flat
-        # between trades (the chart becomes a stair-step curve — that's
-        # the realised-P&L view, no MTM wiggles).
-        equity = pd.Series(1.0, index=df.index)
+        # Bar-indexed equity that STEPS at each trade exit and is flat between
+        # trades. Starts at INITIAL_CAPITAL.
+        equity = pd.Series(INITIAL_CAPITAL, index=df.index, dtype=float)
         for i, exit_time in enumerate(trades["exit_time"]):
             equity.loc[equity.index >= exit_time] = float(compounded[i])
 
@@ -148,18 +158,21 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         trade_ret_std = float(trades["return"].std(ddof=1)) if len(trades) > 1 else 0.0
         trade_ret_mean = float(trades["return"].mean())
     else:
-        equity = pd.Series(1.0, index=df.index)
+        equity = pd.Series(INITIAL_CAPITAL, index=df.index, dtype=float)
         strat_ret = pd.Series(0.0, index=df.index)
         trade_ret_std = 0.0
         trade_ret_mean = 0.0
         trades_per_year = 0.0
 
     # Metrics — all derived from the per-trade compounded equity series.
-    total_return = float(equity.iloc[-1] - 1)
+    final_capital = float(equity.iloc[-1])
+    total_return = final_capital / INITIAL_CAPITAL - 1
+    pnl_usdt = final_capital - INITIAL_CAPITAL
     n_years = (df.index[-1] - df.index[0]).total_seconds() / (365.25 * 86400)
+    growth = final_capital / INITIAL_CAPITAL
     cagr = (
-        float(equity.iloc[-1] ** (1 / n_years) - 1)
-        if n_years and n_years > 0 and equity.iloc[-1] > 0
+        float(growth ** (1 / n_years) - 1)
+        if n_years and n_years > 0 and growth > 0
         else np.nan
     )
     # Per-trade vol / Sharpe / Sortino, annualised by trades/year.
@@ -215,6 +228,9 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
     exposure = float((held != 0).mean())
 
     metrics = {
+        "Initial Capital": INITIAL_CAPITAL,
+        "Final Capital": final_capital,
+        "Net P&L (USDT)": pnl_usdt,
         "Total Return": total_return,
         "CAGR": cagr,
         "Buy & Hold Return": bh_ret,

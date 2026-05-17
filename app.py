@@ -822,7 +822,12 @@ if mode.startswith("Single"):
 
 
     m = result.metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c0, c1, c2, c3, c4, c5 = st.columns(6)
+    c0.metric(
+        f"Final / ${m['Initial Capital']:,.0f}",
+        f"${m['Final Capital']:,.2f}",
+        f"P&L ${m['Net P&L (USDT)']:+,.2f}",
+    )
     c1.metric("Total Return", fmt_pct(m["Total Return"]), f"B&H: {fmt_pct(m['Buy & Hold Return'])}")
     c2.metric("CAGR", fmt_pct(m["CAGR"]))
     c3.metric("Sharpe", fmt_num(m["Sharpe"]))
@@ -844,15 +849,19 @@ if mode.startswith("Single"):
         f"{avg_bars:.1f} bars" if not pd.isna(avg_bars) else None,
     )
 
-    bh_equity = (df["close"] / df["close"].iloc[0])
+    bh_equity = (df["close"] / df["close"].iloc[0]) * m["Initial Capital"]
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
                         vertical_spacing=0.04,
-                        subplot_titles=("Equity (strategy vs buy & hold)", "Price with position shading"))
+                        subplot_titles=(
+                            f"Equity USDT (start = ${m['Initial Capital']:,.0f})  vs buy & hold",
+                            "Price with position shading",
+                        ))
     fig.add_trace(go.Scatter(x=result.equity.index, y=result.equity.values,
                              name="Strategy", line=dict(color="#2E86DE", width=2)), row=1, col=1)
     fig.add_trace(go.Scatter(x=bh_equity.index, y=bh_equity.values,
                              name="Buy & Hold", line=dict(color="#888", width=1, dash="dot")),
                   row=1, col=1)
+    fig.update_yaxes(title_text="Equity (USDT)", row=1, col=1, tickprefix="$", tickformat=",.0f")
     fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"],
                                  low=df["low"], close=df["close"], name="Price",
                                  showlegend=False), row=2, col=1)
@@ -973,7 +982,7 @@ elif mode.startswith("Strategy vs whole"):
         fig.add_trace(go.Scatter(x=bh.index, y=bh.values, name="Buy & Hold",
                                  line=dict(color="#888", width=1, dash="dot")))
         fig.update_layout(height=360, margin=dict(t=30, b=20),
-                          yaxis_title="Equity (start = 1.0)",
+                          yaxis_title="Equity (USDT)",
                           title=f"{strat_name} on {best['Symbol']}")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -999,7 +1008,7 @@ elif mode.startswith("Strategy vs whole"):
             fig.add_trace(go.Scatter(x=eq.index, y=eq.values,
                                      name=r["Symbol"], mode="lines"))
     fig.update_layout(height=450, margin=dict(t=30, b=20),
-                      yaxis_title="Equity (start = 1.0)")
+                      yaxis_title="Equity (USDT)")
     st.plotly_chart(fig, use_container_width=True)
 
     err_rows = [r for r in rows if "error" in r]
@@ -1100,7 +1109,7 @@ else:
                                           name="Buy & Hold",
                                           line=dict(color="#888", width=1, dash="dot")))
             best_fig.update_layout(height=340, margin=dict(t=20, b=20),
-                                   yaxis_title="Equity (start = 1.0)",
+                                   yaxis_title="Equity (USDT)",
                                    title=f"{best['Strategy']} on {best['Symbol']}")
             st.plotly_chart(best_fig, use_container_width=True)
 
@@ -1162,7 +1171,7 @@ else:
         if eq is not None:
             fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name=sym, mode="lines"))
     fig.update_layout(height=450, margin=dict(t=30, b=20),
-                      yaxis_title="Equity (start = 1.0)")
+                      yaxis_title="Equity (USDT)")
     st.plotly_chart(fig, use_container_width=True)
 
     # Full results table + download
