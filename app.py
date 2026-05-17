@@ -24,6 +24,37 @@ from backtest import run_backtest
 
 st.set_page_config(page_title="Crypto 4H Backtester", page_icon="📈", layout="wide")
 st.title("📈 Crypto 4H Backtester")
+
+
+def _scan_traders() -> list[dict]:
+    """Return a list of {pid, live, cmdline} for every running trade.py process
+    on this machine. Used to clean up orphans after Streamlit restarts.
+    """
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,command"], text=True)
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for line in out.splitlines()[1:]:
+        line = line.strip()
+        if not line or "trade.py" not in line or "grep" in line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cmdline = parts[1]
+        if "python" not in cmdline.lower() or "trade.py" not in cmdline:
+            continue
+        rows.append({
+            "pid": pid,
+            "live": "--live" in cmdline,
+            "cmdline": cmdline,
+        })
+    return rows
 st.caption(
     "Top-100 crypto universe (CoinGecko), Binance OHLCV via CCXT, "
     "11 strategies across trend / mean-reversion / momentum / volatility."
@@ -305,38 +336,6 @@ def _save_keys(api_key: str, api_secret: str) -> Path:
     finally:
         os.close(fd)
     return _KEY_STORE
-
-
-def _scan_traders() -> list[dict]:
-    """Return a list of {pid, live, cmdline} for every running trade.py process
-    on this machine. Used to clean up orphans after Streamlit restarts.
-    """
-    try:
-        out = subprocess.check_output(["ps", "-eo", "pid,command"], text=True)
-    except Exception:
-        return []
-    rows: list[dict] = []
-    for line in out.splitlines()[1:]:
-        line = line.strip()
-        if not line or "trade.py" not in line or "grep" in line:
-            continue
-        parts = line.split(None, 1)
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        cmdline = parts[1]
-        # Skip ourselves and any non-trader matches.
-        if "python" not in cmdline.lower() or "trade.py" not in cmdline:
-            continue
-        rows.append({
-            "pid": pid,
-            "live": "--live" in cmdline,
-            "cmdline": cmdline,
-        })
-    return rows
 
 
 def _delete_saved_keys() -> bool:
