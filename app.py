@@ -147,8 +147,16 @@ with st.sidebar:
     st.header("Mode")
     mode = st.radio(
         "Backtest mode",
-        ["Single strategy", "Find best strategy (all strategies × symbols)"],
+        [
+            "Single strategy",
+            "Find best strategy (all strategies × symbols)",
+            "Strategy vs whole universe",
+        ],
         index=0,
+        help=("• Single: one strategy, one symbol.\n"
+              "• Find best: every strategy across the symbols you pick.\n"
+              "• Whole universe: ONE strategy run against every symbol in "
+              "the current market (top-100 spot / all USDⓂ perps)."),
     )
 
     BINANCE_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h",
@@ -180,7 +188,7 @@ with st.sidebar:
     lookback_days = (end_date - start_date).days
     st.caption(f"➡ Lookback: **{lookback_days} days** ({start_date} → {end_date}).")
 
-    # Costs depend on selected symbol (single) or the market default (tournament)
+    # Symbol picker depends on mode.
     if mode.startswith("Single"):
         labels = list(label_map.keys())
         label = st.selectbox(
@@ -189,6 +197,23 @@ with st.sidebar:
         )
         symbol = label_map[label]
         symbols_selected: list[str] = [symbol]
+    elif mode.startswith("Strategy vs whole"):
+        # No per-symbol picker — run on EVERY symbol in the current market.
+        # Provide a sanity cap so a futures run doesn't accidentally fire
+        # 500 × N-bars worth of fetches when the user just wants a quick look.
+        st.caption(
+            f"Will run against **all {len(universe)} {market} symbols** "
+            "currently in the universe (futures = full Binance USDⓂ perp "
+            "list; spot = top-100 by mcap)."
+        )
+        max_n = st.slider(
+            "Cap (top-N by rank)", 5, len(universe),
+            min(len(universe), 50), step=5,
+            help="Limit to the top-N rows of the universe (by 24h volume on "
+                 "futures, by mcap on spot) to keep run time bounded.",
+        )
+        symbols_selected = [label_map[l] for l in list(label_map.keys())[:max_n]]
+        symbol = symbols_selected[0]
     else:
         defaults = list(label_map.keys())[:5]
         labels = st.multiselect(
@@ -255,8 +280,8 @@ with st.sidebar:
     strat_name: str = next(iter(STRATEGIES))
     params: dict = {"allow_short": allow_short}
 
-    # Strategy picker only in single mode
-    if mode.startswith("Single"):
+    # Strategy picker for modes that pick exactly one strategy.
+    if mode.startswith("Single") or mode.startswith("Strategy vs whole"):
         st.header("Strategy")
         strat_name = st.selectbox("Strategy", list(STRATEGIES.keys()))
         spec = STRATEGIES[strat_name]
@@ -275,7 +300,19 @@ with st.sidebar:
                 params[pname] = st.slider(pname, float(lo), float(hi), float(default), float(step))
             else:
                 params[pname] = st.slider(pname, int(lo), int(hi), int(default), int(step))
-        run = st.button("▶ Run backtest", type="primary", use_container_width=True)
+
+        if mode.startswith("Single"):
+            run = st.button("▶ Run backtest", type="primary", use_container_width=True)
+        else:
+            rank_metric = st.selectbox(
+                "Rank by",
+                ["Total Return", "CAGR", "Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"],
+                index=0,
+            )
+            run = st.button(
+                f"▶ Run {strat_name} on {len(symbols_selected)} symbols",
+                type="primary", use_container_width=True,
+            )
     else:
         st.header("Strategies")
         st.caption("All strategies run with **default parameters**.")
@@ -857,6 +894,124 @@ if mode.startswith("Single"):
         st.download_button("Download equity CSV", eq.to_csv().encode(),
                            file_name=f"{symbol.replace('/', '')}_{strat_name}_equity.csv",
                            mime="text/csv")
+
+# ===== Mode 3: One strategy vs whole universe =====
+elif mode.startswith("Strategy vs whole"):
+    if not symbols_selected:
+        st.error("No symbols in the universe.")
+        st.stop()
+
+    st.subheader(
+        f"🌐 {strat_name} vs {len(symbols_selected)} {market} symbol(s)"
+    )
+    st.caption(
+        f"**Lookback:** {start_date} → {end_date} ({lookback_days} days)  ·  "
+        f"**Timeframe:** {timeframe}  ·  **Params:** "
+        f"{ {k: v for k, v in params.items() if k != 'allow_short'} }  ·  "
+        f"**Allow short:** {allow_short}"
+    )
+
+    rows: list[dict] = []
+    equity_curves: dict[str, pd.Series] = {}
+    bh_curves: dict[str, pd.Series] = {}
+    prog = st.progress(0.0, text="Running backtests…")
+    for i, sym in enumerate(symbols_selected, 1):
+        prog.progress(i / len(symbols_selected), text=f"{i}/{len(symbols_selected)}  ·  {sym}")
+        try:
+            df = _trim_to_end(fetch_ohlcv(sym, timeframe=timeframe,
+                                          since_ms=since_ms, market=market))
+            if len(df) < 100:
+                continue
+            pos = spec.func(df, **params)
+            res = run_backtest(df, pos, fee_bps=fee_bps, slippage_bps=slip_bps,
+                               position_size=position_size, leverage=leverage)
+            m = res.metrics
+            rows.append({
+                "Symbol": sym,
+                "Total Return": m["Total Return"], "CAGR": m["CAGR"],
+                "Buy & Hold Return": m["Buy & Hold Return"],
+                "Alpha vs B&H": m["Total Return"] - m["Buy & Hold Return"],
+                "Sharpe": m["Sharpe"], "Sortino": m["Sortino"],
+                "Calmar": m["Calmar"], "Max DD": m["Max Drawdown"],
+                "Profit Factor": m["Profit Factor"], "R:R": m["R:R"],
+                "Win Rate": m["Win Rate"], "# Trades": m["# Trades"],
+                "Exposure": m["Exposure"],
+            })
+            equity_curves[sym] = res.equity
+            bh_curves[sym] = df["close"] / df["close"].iloc[0]
+        except Exception as e:
+            rows.append({"Symbol": sym, "error": str(e)})
+    prog.empty()
+
+    profit_rows = [r for r in rows if "error" not in r]
+    if not profit_rows:
+        st.error("No usable results — every symbol errored or had too little data.")
+        st.stop()
+
+    results = pd.DataFrame(profit_rows)
+    sorted_results = results.sort_values(rank_metric, ascending=False)
+
+    # 🏆 Top winner
+    best = sorted_results.iloc[0]
+    st.subheader(f"🏆 Best symbol for {strat_name}: {best['Symbol']}")
+    b1, b2, b3, b4, b5, b6 = st.columns(6)
+    b1.metric("Symbol", best["Symbol"])
+    b2.metric("Total Return", fmt_pct(best["Total Return"]),
+              f"B&H: {fmt_pct(best['Buy & Hold Return'])}")
+    b3.metric("Alpha vs B&H", fmt_pct(best["Alpha vs B&H"]))
+    b4.metric("Sharpe", fmt_num(best["Sharpe"]))
+    b5.metric("Max DD", fmt_pct(best["Max DD"]))
+    b6.metric("# Trades", str(int(best["# Trades"])))
+
+    # Equity curve of winner
+    if best["Symbol"] in equity_curves:
+        eq = equity_curves[best["Symbol"]]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=eq.index, y=eq.values, name="Strategy",
+                                 line=dict(color="#2E86DE", width=2)))
+        bh = bh_curves[best["Symbol"]]
+        fig.add_trace(go.Scatter(x=bh.index, y=bh.values, name="Buy & Hold",
+                                 line=dict(color="#888", width=1, dash="dot")))
+        fig.update_layout(height=360, margin=dict(t=30, b=20),
+                          yaxis_title="Equity (start = 1.0)",
+                          title=f"{strat_name} on {best['Symbol']}")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Full leaderboard
+    st.subheader(f"📊 Leaderboard ({len(results)} symbols, ranked by {rank_metric})")
+    disp = sorted_results.copy()
+    for c in ["Total Return", "CAGR", "Buy & Hold Return", "Alpha vs B&H",
+              "Max DD", "Win Rate", "Exposure"]:
+        if c in disp:
+            disp[c] = disp[c].map(fmt_pct)
+    for c in ["Sharpe", "Sortino", "Calmar", "Profit Factor", "R:R"]:
+        if c in disp:
+            disp[c] = disp[c].map(fmt_num)
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # Combined equity curves (top 10 by chosen metric)
+    top = sorted_results.head(10)
+    st.subheader(f"Equity curves — top 10 by {rank_metric}")
+    fig = go.Figure()
+    for _, r in top.iterrows():
+        eq = equity_curves.get(r["Symbol"])
+        if eq is not None:
+            fig.add_trace(go.Scatter(x=eq.index, y=eq.values,
+                                     name=r["Symbol"], mode="lines"))
+    fig.update_layout(height=450, margin=dict(t=30, b=20),
+                      yaxis_title="Equity (start = 1.0)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    err_rows = [r for r in rows if "error" in r]
+    if err_rows:
+        with st.expander(f"⚠ Skipped / errored: {len(err_rows)}"):
+            st.dataframe(pd.DataFrame(err_rows), use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download leaderboard CSV",
+        results.to_csv(index=False).encode(),
+        file_name=f"{strat_name}_vs_universe_{market}.csv",
+        mime="text/csv",
+    )
 
 # ===== Mode 2: Find best strategy =====
 else:
