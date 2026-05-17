@@ -91,8 +91,9 @@ def _scan_traders() -> list[dict]:
         })
     return rows
 st.caption(
-    "Top-100 crypto universe (CoinGecko), Binance OHLCV via CCXT, "
-    "11 strategies across trend / mean-reversion / momentum / volatility."
+    "Spot: top-100 by CoinGecko mcap. Futures: full Binance USDⓂ perpetual "
+    "universe. OHLCV via CCXT, 11 strategies across trend / mean-reversion "
+    "/ momentum / volatility."
 )
 
 
@@ -125,7 +126,10 @@ with st.sidebar:
                          help="USDⓂ perpetuals are quoted in USDT.")
     if market == "futures":
         quote = "USDT"
-    with st.spinner(f"Loading top-100 {market} universe…"):
+    _spinner = ("Loading full Binance USDⓂ perpetual universe…"
+                if market == "futures" else
+                "Loading top-100 spot universe…")
+    with st.spinner(_spinner):
         try:
             universe = get_top_symbols(quote=quote, limit=100, market=market)
         except Exception as e:

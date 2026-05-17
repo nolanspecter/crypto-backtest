@@ -22,10 +22,50 @@ def _exchange(market: str):
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def get_top_symbols(quote: str = "USDT", limit: int = 100,
                     market: str = "spot") -> pd.DataFrame:
-    """Return a DataFrame of the top-`limit` coins by market cap that trade on
-    Binance. `market` is "spot" or "futures" (USDⓂ perpetuals).
+    """Return a DataFrame of tradable pairs on Binance.
+
+    * **Spot**: top-`limit` coins by CoinGecko market cap that have a
+      `BASE/quote` pair on Binance.
+    * **Futures**: every USDⓂ linear perpetual quoted in USDT — the whole
+      Binance futures universe (`limit` is ignored). Ranked by 24h quote
+      volume so the most-active perps surface first.
     """
-    rows: list[dict] = []
+    ex = _exchange(market)
+    markets = ex.load_markets()
+
+    if market == "futures":
+        # Whole Binance USDⓂ perpetual universe, ranked by 24h volume.
+        perps = {
+            m: info for m, info in markets.items()
+            if info.get("swap") and info.get("linear") and info.get("quote") == "USDT"
+        }
+        # Best-effort 24h volume ranking via fetch_tickers (one batched call).
+        volumes: dict[str, float] = {}
+        prices: dict[str, float] = {}
+        try:
+            tickers = ex.fetch_tickers(list(perps.keys()))
+            for sym, t in tickers.items():
+                volumes[sym] = float(t.get("quoteVolume") or 0.0)
+                prices[sym] = float(t.get("last") or t.get("close") or 0.0)
+        except Exception:
+            pass  # fall back to alphabetical if tickers fail
+        rows = [
+            {
+                "rank": i + 1,
+                "symbol": sym,
+                "name": info.get("base", sym),
+                "market_cap": volumes.get(sym, 0.0),   # repurposed as 24h $ volume
+                "price": prices.get(sym, 0.0),
+            }
+            for i, (sym, info) in enumerate(
+                sorted(perps.items(),
+                       key=lambda kv: -volumes.get(kv[0], 0.0))
+            )
+        ]
+        return pd.DataFrame(rows)
+
+    # Spot: keep the CoinGecko-ranked filter to limit noise.
+    available = {m: info for m, info in markets.items() if info.get("spot")}
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
@@ -37,29 +77,18 @@ def get_top_symbols(quote: str = "USDT", limit: int = 100,
     r.raise_for_status()
     coins = r.json()
 
-    ex = _exchange(market)
-    markets = ex.load_markets()
-    if market == "futures":
-        # USDⓂ perpetual swaps quoted in USDT
-        available = {
-            m: info for m, info in markets.items()
-            if info.get("swap") and info.get("linear") and info.get("quote") == "USDT"
-        }
-    else:
-        available = {m: info for m, info in markets.items() if info.get("spot")}
-
+    rows: list[dict] = []
     for c in coins:
         sym = (c.get("symbol") or "").upper()
         if not sym:
             continue
         spot_pair = f"{sym}/{quote}"
-        # For futures, CCXT id is "BASE/USDT:USDT". The base/quote match still works.
         match = None
         for m, info in available.items():
             if info.get("base") == sym and info.get("quote") == quote:
                 match = m
                 break
-        if market == "spot" and spot_pair in available:
+        if spot_pair in available:
             match = spot_pair
         if match:
             rows.append({
