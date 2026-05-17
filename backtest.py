@@ -114,19 +114,23 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
     bpy = _bars_per_year(df.index)
 
     # ── Equity, computed PER TRADE not per bar ──────────────────────────────
-    # Why: per-bar `prod(1 + L·r_t)` compounds leverage on every bar inside a
-    # trade, blowing up under L > 1. The realistic close-to-close P&L of a
-    # single trade is L × (exit/entry − 1), and only that should compound
-    # across trades. This matches TradingView's strategy.entry semantics and
-    # what an actual fill-by-fill broker statement looks like.
+    # The ledger's `return` column IS the realised fraction-of-equity P&L for
+    # each trade (already includes leverage and fees). Equity is then just:
+    #
+    #     equity[t] = ∏ (1 + return_i)  for trades exited ≤ t
+    #
+    # Mirrors what you'd compute by hand from the trade sheet.
     leverage_factor = float(position_size) * float(leverage)
-    cost_per_trade = 2.0 * leverage_factor * cost_per_turn  # entry + exit cost
+    cost_per_trade = 2.0 * leverage_factor * cost_per_turn  # entry + exit
     if not trades.empty:
-        gross_per_trade = trades["return"].values * leverage_factor
-        net_per_trade = gross_per_trade - cost_per_trade
-        # Cannot lose more than 100% of equity (margin call hard cap).
-        net_per_trade = np.maximum(net_per_trade, -1.0)
-        compounded = np.cumprod(1.0 + net_per_trade)
+        trades = trades.copy()
+        # Rewrite `return` to be the actual per-trade realised return.
+        # Raw price move × leverage − round-trip cost, capped at −100%
+        # (margin-call floor: a single trade can wipe equity but not push
+        # it negative).
+        trades["return"] = (trades["return"] * leverage_factor - cost_per_trade).clip(lower=-1.0)
+
+        compounded = (1.0 + trades["return"]).cumprod().values
 
         # Bar-indexed equity that STEPS at each trade exit and is flat
         # between trades (the chart becomes a stair-step curve — that's
@@ -135,21 +139,14 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         for i, exit_time in enumerate(trades["exit_time"]):
             equity.loc[equity.index >= exit_time] = float(compounded[i])
 
-        # Per-bar return series is zero except on exit bars; metrics that
-        # used to be bar-frequency (Sharpe/Sortino/Vol) now use the
-        # per-trade return distribution annualised by trades-per-year.
         strat_ret = equity.pct_change().fillna(0.0)
         n_years = max(
             (df.index[-1] - df.index[0]).total_seconds() / (365.25 * 86400),
             1e-9,
         )
-        trades_per_year = len(net_per_trade) / n_years
-        trade_ret_std = float(np.std(net_per_trade, ddof=1)) if len(net_per_trade) > 1 else 0.0
-        trade_ret_mean = float(np.mean(net_per_trade))
-        # Annotate the ledger with the leveraged/net numbers the equity is built from.
-        trades = trades.copy()
-        trades["leveraged_return"] = gross_per_trade
-        trades["net_return"] = net_per_trade
+        trades_per_year = len(trades) / n_years
+        trade_ret_std = float(trades["return"].std(ddof=1)) if len(trades) > 1 else 0.0
+        trade_ret_mean = float(trades["return"].mean())
     else:
         equity = pd.Series(1.0, index=df.index)
         strat_ret = pd.Series(0.0, index=df.index)
@@ -169,10 +166,7 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
     if trades_per_year > 0 and trade_ret_std > 0:
         vol = float(trade_ret_std * np.sqrt(trades_per_year))
         sharpe = float(trade_ret_mean / trade_ret_std * np.sqrt(trades_per_year))
-        neg = (
-            trades["net_return"][trades["net_return"] < 0]
-            if "net_return" in trades.columns else pd.Series(dtype=float)
-        )
+        neg = trades["return"][trades["return"] < 0] if not trades.empty else pd.Series(dtype=float)
         downside = float(neg.std(ddof=1)) if len(neg) > 1 else 0.0
         sortino = float(trade_ret_mean / downside * np.sqrt(trades_per_year)) if downside else np.nan
     else:
@@ -193,18 +187,17 @@ def run_backtest(df: pd.DataFrame, positions: pd.Series,
         bar_seconds = 0.0
 
     if not trades.empty:
-        # Use the LEVERAGED + NET-OF-COSTS return so the stats match what the
-        # equity curve actually realises trade-by-trade.
-        ret_col = "net_return" if "net_return" in trades.columns else "return"
-        wins = trades[trades[ret_col] > 0][ret_col]
-        losses = trades[trades[ret_col] <= 0][ret_col]
+        # `trades["return"]` is now the leveraged net-of-costs realised return,
+        # so the trade-level stats agree with the equity curve by construction.
+        wins = trades[trades["return"] > 0]["return"]
+        losses = trades[trades["return"] <= 0]["return"]
         win_rate = float(len(wins) / len(trades))
         avg_win = float(wins.mean()) if len(wins) else 0.0
         avg_loss = float(losses.mean()) if len(losses) else 0.0
         gross_win = float(wins.sum())
         gross_loss = float(-losses.sum())
         profit_factor = float(gross_win / gross_loss) if gross_loss > 0 else np.inf
-        expectancy = float(trades[ret_col].mean())
+        expectancy = float(trades["return"].mean())
         rr_ratio = float(avg_win / abs(avg_loss)) if avg_loss < 0 else np.nan
         avg_hold_bars = float(trades["bars"].mean())
         avg_hold_seconds = avg_hold_bars * bar_seconds
